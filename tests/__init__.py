@@ -4,37 +4,30 @@ A Fake or multiple fakes for each stripe object.
 Originally collected using API VERSION 2015-07-28.
 Updated to API VERSION 2016-03-07 with bogus fields.
 """
+
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+import datetime
 import json
 import logging
 import os
-import sys
 from copy import deepcopy
-from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Dict
 
 from django.core.exceptions import ObjectDoesNotExist
 from django.db import models
-from django.utils import dateformat, timezone
+from django.utils import dateformat
 
+from djstripe.utils import get_timezone_utc
 from djstripe.webhooks import TEST_EVENT_ID
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.settings")
 logger = logging.getLogger(__name__)
 
-FUTURE_DATE = datetime(2100, 4, 30, tzinfo=timezone.utc)
+FUTURE_DATE = datetime.datetime(2100, 4, 30, tzinfo=get_timezone_utc())
 
 FIXTURE_DIR_PATH = Path(__file__).parent.joinpath("fixtures")
-
-
-# Flags for various bugs with mock autospec
-# These can be removed once we drop support for the affected python versions
-
-# Don't try and use autospec=True on staticmethods on <py3.7
-# see https://bugs.python.org/issue23078
-IS_STATICMETHOD_AUTOSPEC_SUPPORTED = sys.version_info >= (3, 7, 4)
 
 
 class AssertStripeFksMixin:
@@ -90,7 +83,7 @@ class AssertStripeFksMixin:
                         field_value, expected_blank_fks, processed_stripe_ids
                     )
 
-                logger.warning("checked {}".format(field_str))
+                logger.warning("checked %s", field_str)
 
 
 def load_fixture(filename):
@@ -143,7 +136,7 @@ class StripeItem(dict):
         base = self.class_url()
         return "%s/%s" % (base, id)
 
-    def request(self, method, url, params) -> dict:
+    def request(self, method, url, params) -> Dict:
         """Superficial mock that emulates request method."""
         assert method == "post"
         for key, value in params.items():
@@ -228,7 +221,7 @@ class ExternalAccounts(object):
             if fake_external_account["id"] == source:
                 return fake_external_account
 
-    def retrieve(self, id, expand=None):  # noqa
+    def retrieve(self, id, expand=None):
         for fake_external_account in self.external_account_fakes:
             if fake_external_account["id"] == id:
                 return fake_external_account
@@ -256,6 +249,10 @@ class AccountDict(dict):
 FAKE_STANDARD_ACCOUNT = AccountDict(
     load_fixture("account_standard_acct_1Fg9jUA3kq9o1aTc.json")
 )
+
+# Stripe Platform Account to which the STRIPE_SECRET_KEY belongs to
+FAKE_PLATFORM_ACCOUNT = deepcopy(FAKE_STANDARD_ACCOUNT)
+FAKE_PLATFORM_ACCOUNT["settings"]["dashboard"]["display_name"] = "djstripe-platform"
 
 FAKE_CUSTOM_ACCOUNT = AccountDict(
     load_fixture("account_custom_acct_1IuHosQveW0ONQsd.json")
@@ -487,6 +484,10 @@ FAKE_SOURCE_II = SourceDict(
 )
 
 
+FAKE_SOURCE_TRANSACTION = load_fixture(
+    "sourcetransaction_srctxn_fakefakefakefakefake0001.json"
+)
+
 FAKE_PAYMENT_INTENT_I = load_fixture("payment_intent_pi_fakefakefakefakefake0001.json")
 
 FAKE_PAYMENT_INTENT_II = deepcopy(FAKE_PAYMENT_INTENT_I)
@@ -532,7 +533,9 @@ FAKE_SETUP_INTENT_I = {
 FAKE_SETUP_INTENT_II = {
     "application": None,
     "cancellation_reason": None,
-    "client_secret": "seti_1J0g0WJSZQVUcJYgWE2XSi1K_secret_Jdxw2mOaIEHBdE6eTsfJ2IfmamgNJaF",
+    "client_secret": (
+        "seti_1J0g0WJSZQVUcJYgWE2XSi1K_secret_Jdxw2mOaIEHBdE6eTsfJ2IfmamgNJaF"
+    ),
     "created": 1623301244,
     "customer": "cus_6lsBvm5rJ0zyHc",
     "description": None,
@@ -563,9 +566,12 @@ FAKE_SETUP_INTENT_DESTINATION_CHARGE = load_fixture(
 FAKE_SESSION_I = {
     "id": "cs_test_OAgNmy75Td25OeREvKUs8XZ7SjMPO9qAplqHO1sBaEjOg9fYbaeMh2nA",
     "object": "checkout.session",
+    "amount_total": 1500,
+    "amount_subtotal": 1500,
     "billing_address_collection": None,
     "cancel_url": "https://example.com/cancel",
     "client_reference_id": None,
+    "currency": "usd",
     "customer": "cus_6lsBvm5rJ0zyHc",
     "customer_email": None,
     "display_items": [
@@ -586,10 +592,20 @@ FAKE_SESSION_I = {
     "mode": None,
     "payment_intent": FAKE_PAYMENT_INTENT_I["id"],
     "payment_method_types": ["card"],
-    "setup_intent": None,
+    "payment_status": "unpaid",
+    "setup_intent": FAKE_SETUP_INTENT_II["id"],
+    "shipping_address_collection": {},
+    "shipping_cost": {},
+    "shipping_details": {},
+    "shipping_options": {},
+    "status": "open",
     "submit_type": None,
     "subscription": None,
     "success_url": "https://example.com/success",
+    "metadata": {},
+    "line_tems": {},
+    "url": "",
+    "total_details": {},
 }
 
 
@@ -754,6 +770,7 @@ FAKE_CHARGE_REFUNDED["refunds"].update(
 FAKE_COUPON = {
     "id": "fake-coupon-1",
     "object": "coupon",
+    "applies_to": {"products": ["prod_fake1"]},
     "amount_off": None,
     "created": 1490157071,
     "currency": None,
@@ -769,56 +786,76 @@ FAKE_COUPON = {
 }
 
 
-FAKE_DISPUTE = {
-    "id": "dp_XXXXXXXXXXXXXXXXXXXXXXXX",
-    "object": "dispute",
-    "amount": 499,
-    "balance_transaction": FAKE_BALANCE_TRANSACTION_III["id"],
-    "balance_transactions": [deepcopy(FAKE_BALANCE_TRANSACTION_III)],
-    "charge": FAKE_CHARGE["id"],
-    "created": 1515012086,
-    "currency": "usd",
-    "evidence": {
-        "access_activity_log": None,
-        "billing_address": None,
-        "cancellation_policy": None,
-        "cancellation_policy_disclosure": None,
-        "cancellation_rebuttal": None,
-        "customer_communication": None,
-        "customer_email_address": "customer@example.com",
-        "customer_name": "customer@example.com",
-        "customer_purchase_ip": "127.0.0.1",
-        "customer_signature": None,
-        "duplicate_charge_documentation": None,
-        "duplicate_charge_explanation": None,
-        "duplicate_charge_id": None,
-        "product_description": None,
-        "receipt": "file_XXXXXXXXXXXXXXXXXXXXXXXX",
-        "refund_policy": None,
-        "refund_policy_disclosure": None,
-        "refund_refusal_explanation": None,
-        "service_date": None,
-        "service_documentation": None,
-        "shipping_address": None,
-        "shipping_carrier": None,
-        "shipping_date": None,
-        "shipping_documentation": None,
-        "shipping_tracking_number": None,
-        "uncategorized_file": None,
-        "uncategorized_text": None,
-    },
-    "evidence_details": {
-        "due_by": 1516406399,
-        "has_evidence": False,
-        "past_due": False,
-        "submission_count": 0,
-    },
-    "is_charge_refundable": False,
-    "livemode": True,
-    "metadata": {},
-    "reason": "subscription_canceled",
-    "status": "needs_response",
-}
+FAKE_DISPUTE_CHARGE = load_fixture("dispute_ch_fakefakefakefake01.json")
+
+FAKE_DISPUTE_BALANCE_TRANSACTION = load_fixture("dispute_txn_fakefakefakefake01.json")
+
+# case when a dispute gets closed and the funds get reinstated (full)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_FULL = deepcopy(
+    FAKE_DISPUTE_BALANCE_TRANSACTION
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_FULL["amount"] = (
+    -1 * FAKE_DISPUTE_BALANCE_TRANSACTION["amount"]
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_FULL["fee"] = (
+    -1 * FAKE_DISPUTE_BALANCE_TRANSACTION["fee"]
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_FULL["net"] = (
+    -1 * FAKE_DISPUTE_BALANCE_TRANSACTION["net"]
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_FULL["fee_details"][0]["amount"] = (
+    -1 * FAKE_DISPUTE_BALANCE_TRANSACTION["fee_details"][0]["amount"]
+)
+
+# case when a dispute gets closed and the funds get reinstated (partial)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_PARTIAL = deepcopy(
+    FAKE_DISPUTE_BALANCE_TRANSACTION
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_PARTIAL["amount"] = (
+    -0.9 * FAKE_DISPUTE_BALANCE_TRANSACTION["amount"]
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_PARTIAL["fee"] = (
+    -0.9 * FAKE_DISPUTE_BALANCE_TRANSACTION["fee"]
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_PARTIAL["net"] = (
+    -0.9 * FAKE_DISPUTE_BALANCE_TRANSACTION["net"]
+)
+FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_PARTIAL["fee_details"][0]["amount"] = (
+    -0.9 * FAKE_DISPUTE_BALANCE_TRANSACTION["fee_details"][0]["amount"]
+)
+
+
+FAKE_DISPUTE_PAYMENT_INTENT = load_fixture("dispute_pi_fakefakefakefake01.json")
+
+FAKE_DISPUTE_PAYMENT_METHOD = load_fixture("dispute_pm_fakefakefakefake01.json")
+
+# case when dispute gets created
+FAKE_DISPUTE_I = load_fixture("dispute_dp_fakefakefakefake01.json")
+
+# case when funds get withdrawn from platform account due to dispute
+FAKE_DISPUTE_II = load_fixture("dispute_dp_fakefakefakefake02.json")
+
+# case when dispute gets updated
+FAKE_DISPUTE_III = deepcopy(FAKE_DISPUTE_II)
+FAKE_DISPUTE_III["evidence"]["receipt"] = "file_4hshrsKatMEEd6736724HYAXyj"
+
+# case when dispute gets closed
+FAKE_DISPUTE_IV = deepcopy(FAKE_DISPUTE_II)
+FAKE_DISPUTE_IV["evidence"]["receipt"] = "file_4hshrsKatMEEd6736724HYAXyj"
+FAKE_DISPUTE_IV["status"] = "won"
+
+# case when dispute funds get reinstated (partial)
+FAKE_DISPUTE_V_PARTIAL = load_fixture("dispute_dp_funds_reinstated_full.json")
+FAKE_DISPUTE_V_PARTIAL["balance_transactions"][1] = (
+    FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_PARTIAL
+)
+
+
+# case when dispute funds get reinstated (full)
+FAKE_DISPUTE_V_FULL = load_fixture("dispute_dp_funds_reinstated_full.json")
+FAKE_DISPUTE_V_FULL["balance_transactions"][1] = (
+    FAKE_DISPUTE_BALANCE_TRANSACTION_REFUND_FULL
+)
 
 
 FAKE_PRODUCT = load_fixture("product_prod_fake1.json")
@@ -981,7 +1018,7 @@ class SubscriptionDict(StripeItem):
         self["items"] = StripeList(self["items"])
 
     def __setattr__(self, name, value):
-        if type(value) == datetime:
+        if type(value) is datetime.datetime:
             value = datetime_to_unix(value)
 
         # Special case for price and plan
@@ -1069,6 +1106,7 @@ FAKE_SUBSCRIPTION_METERED = SubscriptionDict(
                 }
             ]
         },
+        "pause_collection": None,
         "plan": deepcopy(FAKE_PLAN_METERED),
         "quantity": 1,
         "start": 1439229181,
@@ -1080,14 +1118,69 @@ FAKE_SUBSCRIPTION_METERED = SubscriptionDict(
     }
 )
 
+
+FAKE_SUBSCRIPTION_ITEM_METERED = {
+    "id": "si_JiphMAMFxZKW8s",
+    "object": "subscription_item",
+    "metadata": {},
+    "billing_thresholds": "",
+    "created": 1441907581,
+    "plan": deepcopy(FAKE_PLAN_METERED),
+    "price": deepcopy(FAKE_PRICE_METERED),
+    "quantity": 1,
+    "subscription": FAKE_SUBSCRIPTION_METERED["id"],
+    "tax_rates": [],
+}
+
+FAKE_SUBSCRIPTION_ITEM_MULTI_PLAN = {
+    "id": "si_JiphMAMFxZKW8s",
+    "object": "subscription_item",
+    "metadata": {},
+    "billing_thresholds": "",
+    "created": 1441907581,
+    "plan": deepcopy(FAKE_PLAN),
+    "price": deepcopy(FAKE_PRICE),
+    "quantity": 1,
+    "subscription": FAKE_SUBSCRIPTION_MULTI_PLAN["id"],
+    "tax_rates": [],
+}
+
+FAKE_SUBSCRIPTION_ITEM_TAX_RATES = {
+    "id": "si_JiphMAMFxZKW8s",
+    "object": "subscription_item",
+    "metadata": {},
+    "billing_thresholds": "",
+    "created": 1441907581,
+    "plan": deepcopy(FAKE_PLAN_II),
+    "price": deepcopy(FAKE_PRICE_II),
+    "quantity": 1,
+    "subscription": FAKE_SUBSCRIPTION_II["id"],
+    "tax_rates": [
+        {
+            "id": "txr_fakefakefakefakefake0001",
+            "object": "tax_rate",
+            "active": True,
+            "created": 1593225980,
+            "description": None,
+            "display_name": "VAT",
+            "inclusive": True,
+            "jurisdiction": "Example1",
+            "livemode": False,
+            "metadata": {"djstripe_test_fake_id": "txr_fakefakefakefakefake0001"},
+            "percentage": 15.0,
+        }
+    ],
+}
+
+
 FAKE_SUBSCRIPTION_SCHEDULE = {
     "id": "sub_sched_1Hm7q6Fz0jfFqjGs2OxOSCzD",
     "object": "subscription_schedule",
     "canceled_at": None,
     "completed_at": None,
     "created": 1605056974,
-    "current_phase": None,
-    "customer": "cus_4UbFSo9tl62jqj",  # FAKE_CUSTOMER_II
+    "current_phase": {},
+    "customer": "cus_6lsBvm5rJ0zyHc",  # FAKE_CUSTOMER
     "default_settings": {
         "billing_cycle_anchor": "automatic",
         "billing_thresholds": None,
@@ -1133,8 +1226,14 @@ FAKE_SUBSCRIPTION_SCHEDULE = {
     "released_subscription": None,
     "renewal_interval": None,
     "status": "not_started",
-    "subscription": None,
+    "subscription": FAKE_SUBSCRIPTION["id"],
 }
+
+
+FAKE_SHIPPING_RATE = load_fixture("shipping_rate_shr_fakefakefakefakefake0001.json")
+FAKE_SHIPPING_RATE_WITH_TAX_CODE = load_fixture(
+    "shipping_rate_shr_fakefakefakefakefake0002.json"
+)
 
 
 class Sources(object):
@@ -1146,7 +1245,7 @@ class Sources(object):
             if fake_card["id"] == source:
                 return fake_card
 
-    def retrieve(self, id, expand=None):  # noqa
+    def retrieve(self, id, expand=None):
         for fake_card in self.card_fakes:
             if fake_card["id"] == id:
                 return fake_card
@@ -1165,7 +1264,7 @@ def convert_source_dict(data):
         elif source_type == "source":
             data = SourceDict(data)
         else:
-            raise ValueError("Unknown source type: {}".format(source_type))
+            raise ValueError(f"Unknown source type: {source_type}")
 
     return data
 
@@ -1201,6 +1300,7 @@ class CustomerDict(dict):
 FAKE_CUSTOMER = CustomerDict(load_fixture("customer_cus_6lsBvm5rJ0zyHc.json"))
 
 
+# Customer with multiple subscriptions (all licensed usagetype)
 FAKE_CUSTOMER_II = CustomerDict(load_fixture("customer_cus_4UbFSo9tl62jqj.json"))
 
 
@@ -1214,14 +1314,40 @@ FAKE_CUSTOMER_IV = CustomerDict(
 )
 
 
+FAKE_DISCOUNT = {
+    "id": "di_fakefakefakefakefake0001",
+    "object": "discount",
+    "description": "",
+    "checkout_session": None,
+    "coupon": deepcopy(FAKE_COUPON),
+    "customer": FAKE_CUSTOMER,
+    "end": None,
+    "invoice": None,
+    "invoice_item": None,
+    "promotion_code": "",
+    "start": 1493206114,
+    "subscription": "sub_fakefakefakefakefake0001",
+}
+
 FAKE_DISCOUNT_CUSTOMER = {
+    "id": "di_fakefakefakefakefake0002",
     "object": "discount",
     "coupon": deepcopy(FAKE_COUPON),
-    "customer": FAKE_CUSTOMER["id"],
+    "customer": deepcopy(FAKE_CUSTOMER),
     "start": 1493206114,
     "end": None,
     "subscription": None,
 }
+
+
+FAKE_LINE_ITEM = load_fixture("line_item_il_invoice_item_fakefakefakefakefake0001.json")
+FAKE_LINE_ITEM["discounts"] = [deepcopy(FAKE_DISCOUNT_CUSTOMER)]
+
+FAKE_LINE_ITEM_SUBSCRIPTION = load_fixture(
+    "line_item_il_invoice_item_fakefakefakefakefake0002.json"
+)
+FAKE_LINE_ITEM_SUBSCRIPTION["discounts"] = [deepcopy(FAKE_DISCOUNT_CUSTOMER)]
+FAKE_LINE_ITEM_SUBSCRIPTION["discounts"][0]["subscription"] = "sub_1rn1dp7WgjMtx9"
 
 
 class InvoiceDict(StripeItem):
@@ -1234,7 +1360,17 @@ class InvoiceDict(StripeItem):
         return self
 
 
-FAKE_INVOICE = InvoiceDict(load_fixture("invoice_in_fakefakefakefakefake0001.json"))
+FAKE_INVOICE = load_fixture("invoice_in_fakefakefakefakefake0001.json")
+FAKE_INVOICE["lines"] = {
+    "object": "list",
+    "data": [deepcopy(FAKE_LINE_ITEM)],
+    "has_more": False,
+    "total_count": 1,
+    "url": "/v1/invoices/in_fakefakefakefakefake0001/lines",
+}
+FAKE_INVOICE = InvoiceDict(FAKE_INVOICE)
+
+
 FAKE_INVOICE_IV = InvoiceDict(load_fixture("invoice_in_fakefakefakefakefake0004.json"))
 
 
@@ -1256,27 +1392,11 @@ FAKE_INVOICE_II = InvoiceDict(
         "created": 1439785128,
         "description": None,
         "discount": None,
+        "discounts": [],
         "due_date": None,
         "ending_balance": 0,
         "lines": {
-            "data": [
-                {
-                    "id": FAKE_SUBSCRIPTION_III["id"],
-                    "object": "line_item",
-                    "amount": 2000,
-                    "currency": "usd",
-                    "description": None,
-                    "discountable": True,
-                    "livemode": True,
-                    "metadata": {},
-                    "period": {"start": 1442469907, "end": 1445061907},
-                    "plan": deepcopy(FAKE_PLAN),
-                    "proration": False,
-                    "quantity": 1,
-                    "subscription": None,
-                    "type": "subscription",
-                }
-            ],
+            "data": [deepcopy(FAKE_LINE_ITEM_SUBSCRIPTION)],
             "total_count": 1,
             "object": "list",
             "url": "/v1/invoices/in_16af5A2eZvKYlo2CJjANLL81/lines",
@@ -1319,27 +1439,11 @@ FAKE_INVOICE_III = InvoiceDict(
         "customer": "cus_6lsBvm5rJ0zyHc",
         "description": None,
         "discount": None,
+        "discounts": [],
         "due_date": None,
         "ending_balance": 20,
         "lines": {
-            "data": [
-                {
-                    "id": FAKE_SUBSCRIPTION["id"],
-                    "object": "line_item",
-                    "amount": 2000,
-                    "currency": "usd",
-                    "description": None,
-                    "discountable": True,
-                    "livemode": True,
-                    "metadata": {},
-                    "period": {"start": 1442111228, "end": 1444703228},
-                    "plan": deepcopy(FAKE_PLAN),
-                    "proration": False,
-                    "quantity": 1,
-                    "subscription": None,
-                    "type": "subscription",
-                }
-            ],
+            "data": [deepcopy(FAKE_LINE_ITEM_SUBSCRIPTION)],
             "total_count": 1,
             "object": "list",
             "url": "/v1/invoices/in_16Z9dP2eZvKYlo2CgFHgFx2Z/lines",
@@ -1362,6 +1466,71 @@ FAKE_INVOICE_III = InvoiceDict(
         "webhooks_delivered_at": 1439426955,
     }
 )
+
+FAKE_INVOICE_METERED_SUBSCRIPTION_USAGE = deepcopy(FAKE_SUBSCRIPTION_METERED)
+FAKE_INVOICE_METERED_SUBSCRIPTION_USAGE["customer"] = FAKE_CUSTOMER_II["id"]
+
+
+FAKE_SUBSCRIPTION_ITEM = {
+    "id": "si_JiphMAMFxZKW8s",
+    "object": "subscription_item",
+    "metadata": {},
+    "billing_thresholds": "",
+    "created": 1441907581,
+    "plan": deepcopy(FAKE_PLAN_METERED),
+    "price": deepcopy(FAKE_PRICE_METERED),
+    "quantity": 1,
+    "subscription": FAKE_INVOICE_METERED_SUBSCRIPTION_USAGE["id"],
+    "tax_rates": [],
+}
+
+
+FAKE_INVOICE_METERED_SUBSCRIPTION = InvoiceDict(
+    {
+        "id": "in_1JGGM6JSZQVUcJYgpWqfBOIl",
+        "livemode": False,
+        "created": 1439425915,
+        "metadata": {},
+        "description": "",
+        "amount_due": "1.05",
+        "amount_paid": "1.05",
+        "amount_remaining": "0.00",
+        "application_fee_amount": None,
+        "attempt_count": 1,
+        "attempted": True,
+        "auto_advance": False,
+        "collection_method": "charge_automatically",
+        "currency": "usd",
+        "customer": FAKE_CUSTOMER_II["id"],
+        "object": "invoice",
+        "charge": None,
+        "discount": None,
+        "discounts": [],
+        "due_date": None,
+        "ending_balance": 0,
+        "lines": {
+            "data": [deepcopy(FAKE_LINE_ITEM_SUBSCRIPTION)],
+            "total_count": 1,
+            "object": "list",
+            "url": "/v1/invoices/in_1JGGM6JSZQVUcJYgpWqfBOIl/lines",
+        },
+        "next_payment_attempt": None,
+        "number": "84DE1540-0004",
+        "paid": True,
+        "period_end": 1439424571,
+        "period_start": 1436746171,
+        "receipt_number": None,
+        "starting_balance": 0,
+        "statement_descriptor": None,
+        "subscription": FAKE_INVOICE_METERED_SUBSCRIPTION_USAGE["id"],
+        "subtotal": "1.00",
+        "tax": None,
+        "tax_percent": None,
+        "total": "1.00",
+        "webhooks_delivered_at": 1439426955,
+    }
+)
+
 
 FAKE_UPCOMING_INVOICE = InvoiceDict(
     {
@@ -1395,35 +1564,11 @@ FAKE_UPCOMING_INVOICE = InvoiceDict(
             }
         ],
         "discount": None,
+        "discounts": [],
         "due_date": None,
         "ending_balance": None,
         "lines": {
-            "data": [
-                {
-                    "id": FAKE_SUBSCRIPTION["id"],
-                    "object": "line_item",
-                    "amount": 2000,
-                    "currency": "usd",
-                    "description": None,
-                    "discountable": True,
-                    "livemode": True,
-                    "metadata": {},
-                    "period": {"start": 1441907581, "end": 1444499581},
-                    "plan": deepcopy(FAKE_PLAN),
-                    "proration": False,
-                    "quantity": 1,
-                    "subscription": None,
-                    "tax_amounts": [
-                        {
-                            "amount": 261,
-                            "inclusive": True,
-                            "tax_rate": "txr_fakefakefakefakefake0001",
-                        }
-                    ],
-                    "tax_rates": [],
-                    "type": "subscription",
-                }
-            ],
+            "data": [deepcopy(FAKE_LINE_ITEM_SUBSCRIPTION)],
             "total_count": 1,
             "object": "list",
             "url": "/v1/invoices/in_fakefakefakefakefake0001/lines",
@@ -1459,8 +1604,47 @@ FAKE_TAX_RATE_EXAMPLE_2_SALES = load_fixture(
     "tax_rate_txr_fakefakefakefakefake0002.json"
 )
 
-FAKE_INVOICEITEM = {
-    "id": "ii_16XVTY2eZvKYlo2Cxz5n3RaS",
+FAKE_TAX_ID = load_fixture("tax_id_txi_fakefakefakefakefake0001.json")
+
+
+FAKE_EVENT_TAX_ID_CREATED = {
+    "id": "evt_16YKQi2eZvKYlo2CT2oe5ff3",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_TAX_ID)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_ZoH080M8fny6yR",
+    "type": "customer.tax_id.created",
+}
+
+FAKE_TAX_ID_UPDATED = deepcopy(FAKE_TAX_ID)
+FAKE_TAX_ID_UPDATED["verification"] = {
+    "status": "verified",
+    "verified_address": None,
+    "verified_name": "Test",
+}
+
+FAKE_EVENT_TAX_ID_UPDATED = {
+    "id": "evt_1J6Fy3JSZQVUcJYgnddjnMzx",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_TAX_ID_UPDATED)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_ZoH080M8fny6yR",
+    "type": "customer.tax_id.updated",
+}
+
+FAKE_EVENT_TAX_ID_DELETED = deepcopy(FAKE_EVENT_TAX_ID_UPDATED)
+FAKE_EVENT_TAX_ID_DELETED["type"] = "customer.tax_id.deleted"
+
+FAKE_TAX_CODE = load_fixture("tax_code_txcd_fakefakefakefakefake0001.json")
+
+FAKE_INVOICEITEM_II = {
+    "id": "ii_fakefakefakefakefake0001",
     "object": "invoiceitem",
     "amount": 2000,
     "currency": "usd",
@@ -1484,8 +1668,8 @@ FAKE_INVOICEITEM = {
     "unit_amount_decimal": "2000",
 }
 
-FAKE_INVOICEITEM_II = {
-    "id": "ii_16XVTY2eZvKYlo2Cxz5n3RaS",
+FAKE_INVOICEITEM = {
+    "id": "ii_fakefakefakefakefake0001",  # todo make these ids unique as well
     "object": "invoiceitem",
     "amount": 2000,
     "currency": "usd",
@@ -1512,7 +1696,7 @@ FAKE_INVOICEITEM_II = {
 # Invoice item with tax_rates
 # TODO generate this
 FAKE_INVOICEITEM_III = {
-    "id": "ii_16XVTY2eZvKYlo2Cxz5n3RaS",
+    "id": "ii_fakefakefakefakefake0001",  # todo make these ids unique as well
     "object": "invoiceitem",
     "amount": 2000,
     "currency": "usd",
@@ -1547,7 +1731,7 @@ FAKE_TRANSFER = {
     "created": 1439185846,
     "currency": "usd",
     "description": "Test description - 1439185984",
-    "destination": "acct_16Y9B9Fso9hLaeLu",
+    "destination": FAKE_STANDARD_ACCOUNT["id"],
     "destination_payment": "py_16Y9BKFso9hLaeLueFmWAYUi",
     "livemode": False,
     "metadata": {},
@@ -1564,60 +1748,85 @@ FAKE_TRANSFER = {
     "source_type": "bank_account",
 }
 
-FAKE_TRANSFER_II = {
-    "id": "tr_16hTzv2eZvKYlo2CWuyMmuvV",
+FAKE_TRANSFER_WITH_1_REVERSAL = {
+    "id": "tr_16Y9BK2eZvKYlo2CR0ySu1BA",
     "object": "transfer",
-    "amount": 2000,
+    "amount": 100,
     "amount_reversed": 0,
     "application_fee_amount": None,
-    "balance_transaction": deepcopy(FAKE_BALANCE_TRANSACTION_III),
-    "bank_account": deepcopy(FAKE_BANK_ACCOUNT),
-    "created": 1440420000,
+    "balance_transaction": deepcopy(FAKE_BALANCE_TRANSACTION_II),
+    "created": 1439185846,
     "currency": "usd",
-    "description": None,
-    "destination": "ba_16hTzo2eZvKYlo2CeSjfb0tS",
+    "description": "Test description - 1439185984",
+    "destination": FAKE_STANDARD_ACCOUNT["id"],
+    "destination_payment": "py_16Y9BKFso9hLaeLueFmWAYUi",
     "livemode": False,
-    "metadata": {"foo": "bar"},
-    "recipient": "rp_16hTzu2eZvKYlo2C9A5mgxEj",
+    "metadata": {},
+    "recipient": None,
     "reversals": {
         "object": "list",
-        "total_count": 0,
+        "total_count": 1,
         "has_more": False,
-        "url": "/v1/transfers/tr_16hTzv2eZvKYlo2CWuyMmuvV/reversals",
-        "data": [],
+        "url": "/v1/transfers/tr_16Y9BK2eZvKYlo2CR0ySu1BA/reversals",
+        "data": [
+            {
+                "id": "trr_1J5UlFJSZQVUcJYgb38m1OZO",
+                "object": "transfer_reversal",
+                "amount": 20,
+                "balance_transaction": deepcopy(FAKE_BALANCE_TRANSACTION_II),
+                "created": 1624449653,
+                "currency": "usd",
+                "destination_payment_refund": "pyr_1J5UlFR44xKqawmIBvFa6gW9",
+                "metadata": {},
+                "source_refund": None,
+                "transfer": deepcopy(FAKE_TRANSFER),
+            }
+        ],
     },
     "reversed": False,
     "source_transaction": None,
-    "source_type": "card",
+    "source_type": "bank_account",
 }
 
-FAKE_TRANSFER_III = {
-    "id": "tr_17O4U52eZvKYlo2CmyYbDAEy",
-    "object": "transfer",
-    "amount": 19010,
-    "amount_reversed": 0,
-    "application_fee_amount": None,
-    "balance_transaction": deepcopy(FAKE_BALANCE_TRANSACTION_IV),
-    "bank_account": deepcopy(FAKE_BANK_ACCOUNT_II),
-    "created": 1451560845,
-    "currency": "usd",
-    "date": 1451560845,
-    "description": "Transfer+for+test@example.com",
-    "destination": "ba_17O4Tz2eZvKYlo2CMYsxroV5",
+
+FAKE_USAGE_RECORD = {
+    "id": "mbur_1JPJz2JSZQVUcJYgK4otTE2V",
     "livemode": False,
-    "metadata": {"foo2": "bar2"},
-    "recipient": "rp_17O4U42eZvKYlo2CLk4upfDE",
-    "reversals": {
-        "object": "list",
-        "total_count": 0,
-        "has_more": False,
-        "url": "/v1/transfers/tr_17O4U52eZvKYlo2CmyYbDAEy/reversals",
-        "data": [],
-    },
-    "reversed": False,
-    "source_transaction": None,
-    "source_type": "card",
+    "object": "usage_record",
+    "quantity": 100,
+    "subscription_item": FAKE_SUBSCRIPTION_ITEM["id"],
+    "timestamp": 1629174774,
+    "action": "increment",
 }
+
+
+class UsageRecordSummaryDict(StripeItem):
+    pass
+
+
+FAKE_USAGE_RECORD_SUMMARY = UsageRecordSummaryDict(
+    load_fixture("usage_record_summary_sis_fakefakefakefakefake0001.json")
+)
+
+
+class WebhookEndpointDict(StripeItem):
+    pass
+
+
+FAKE_WEBHOOK_ENDPOINT_1 = WebhookEndpointDict(
+    load_fixture("webhook_endpoint_fake0001.json")
+)
+
+
+class PayoutDict(StripeItem):
+    pass
+
+
+FAKE_PAYOUT_CUSTOM_BANK_ACCOUNT = PayoutDict(
+    load_fixture("payout_custom_bank_account.json")
+)
+FAKE_PAYOUT_CUSTOM_CARD = PayoutDict(load_fixture("payout_custom_card.json"))
+
 
 FAKE_ACCOUNT = {
     "id": "acct_1032D82eZvKYlo2C",
@@ -1626,8 +1835,8 @@ FAKE_ACCOUNT = {
         "name": "dj-stripe",
         "support_email": "djstripe@example.com",
         "support_phone": None,
-        "support_url": "https://djstripe.com/support/",
-        "url": "https://djstripe.com",
+        "support_url": "https://example.com/support/",
+        "url": "https://example.com",
     },
     "settings": {
         "branding": {
@@ -1711,6 +1920,18 @@ FAKE_FILEUPLOAD_ICON = {
     "url": "https://files.stripe.com/files/f_test_BTJFKcS7VDahgkjqw8EVNWlM",
 }
 
+FAKE_EVENT_FILE_CREATED = {
+    "id": "evt_1J5TusR44xKqawmIQVXSrGyf",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_FILEUPLOAD_ICON)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_sTSstDDIOpKi2w",
+    "type": "file.created",
+}
+
 
 FAKE_EVENT_ACCOUNT_APPLICATION_DEAUTHORIZED = dict(
     load_fixture("event_account_application_deauthorized.json")
@@ -1786,7 +2007,7 @@ FAKE_EVENT_TEST_CHARGE_SUCCEEDED["id"] = TEST_EVENT_ID
 FAKE_EVENT_CUSTOMER_CREATED = {
     "id": "evt_38DHch3whaDvKYlo2CT2oe5ff3",
     "object": "event",
-    "api_version": "2016-03-07",
+    "api_version": "2016-03-07; orders_beta=v3",
     "created": 1439229084,
     "data": {"object": deepcopy(FAKE_CUSTOMER)},
     "livemode": False,
@@ -1795,20 +2016,24 @@ FAKE_EVENT_CUSTOMER_CREATED = {
     "type": "customer.created",
 }
 
+FAKE_EVENT_CUSTOMER_UPDATED = deepcopy(FAKE_EVENT_CUSTOMER_CREATED)
+FAKE_EVENT_CUSTOMER_UPDATED["type"] = "customer.updated"
+
+
 FAKE_EVENT_CUSTOMER_DELETED = deepcopy(FAKE_EVENT_CUSTOMER_CREATED)
 FAKE_EVENT_CUSTOMER_DELETED.update(
     {"id": "evt_38DHch3whaDvKYlo2jksfsFFxy", "type": "customer.deleted"}
 )
 
 FAKE_EVENT_CUSTOMER_DISCOUNT_CREATED = {
-    "id": "evt_test_customer.discount.created",
+    "id": "AGBWvF5zBm4sMCsLLPZrw9YY",
     "object": "event",
     "api_version": "2018-05-21",
     "created": 1439229084,
     "data": {"object": deepcopy(FAKE_DISCOUNT_CUSTOMER)},
     "livemode": False,
-    "pending_webhooks": 1,
-    "request": {"id": "req_6l38DHch3whaDj", "idempotency_key": None},
+    "pending_webhooks": 0,
+    "request": "req_6l38DHch3whaDj",
     "type": "customer.discount.created",
 }
 
@@ -1819,6 +2044,7 @@ FAKE_EVENT_CUSTOMER_DISCOUNT_DELETED = {
     "api_version": "2017-02-14",
     "created": 1439229084,
     "object": "event",
+    "livemode": False,
     "pending_webhooks": 0,
     "request": "req_6l38DHch3whaDj",
     "data": {"object": deepcopy(FAKE_DISCOUNT_CUSTOMER)},
@@ -1868,12 +2094,87 @@ FAKE_EVENT_DISPUTE_CREATED = {
     "object": "event",
     "api_version": "2017-08-15",
     "created": 1439229084,
-    "data": {"object": deepcopy(FAKE_DISPUTE)},
+    "data": {"object": deepcopy(FAKE_DISPUTE_I)},
     "livemode": False,
     "pending_webhooks": 0,
     "request": "req_6lsB7hkicwhaDj",
     "type": "charge.dispute.created",
 }
+
+
+FAKE_EVENT_DISPUTE_FUNDS_WITHDRAWN = {
+    "id": "evt_1JAyTxJSZQVUcJYgNk1Jqu8o",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_DISPUTE_II)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "charge.dispute.funds_withdrawn",
+}
+
+
+FAKE_EVENT_DISPUTE_UPDATED = {
+    "id": "evt_1JAyTxJSZQVUcJYgNk1Jqu8o",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_DISPUTE_III)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "charge.dispute.funds_withdrawn",
+}
+
+FAKE_EVENT_DISPUTE_CLOSED = {
+    "id": "evt_1JAyTxJSZQVUcJYgNk1Jqu8o",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_DISPUTE_IV)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "charge.dispute.closed",
+}
+
+FAKE_EVENT_DISPUTE_FUNDS_REINSTATED_FULL = {
+    "id": "evt_1JAyTxJSZQVUcJYgNk1Jqu8o",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_DISPUTE_V_FULL)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "charge.dispute.funds_reinstated",
+}
+
+FAKE_EVENT_DISPUTE_FUNDS_REINSTATED_PARTIAL = {
+    "id": "evt_1JAyTxJSZQVUcJYgNk1Jqu8o",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_DISPUTE_V_PARTIAL)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "charge.dispute.funds_reinstated",
+}
+
+FAKE_EVENT_SESSION_COMPLETED = {
+    "id": "evt_1JAyTxJSZQVUcJYgNk1Jqu8o",
+    "object": "event",
+    "api_version": "2020-08-27",
+    "created": 1439229084,
+    "data": {"object": deepcopy(FAKE_SESSION_I)},
+    "livemode": False,
+    "pending_webhooks": 0,
+    "request": "req_6lsB7hkicwhaDj",
+    "type": "checkout.session.completed",
+}
+
 
 FAKE_EVENT_INVOICE_CREATED = {
     "id": "evt_187IHD2eZvKYlo2C6YKQi2eZ",
@@ -2078,18 +2379,21 @@ FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED = {
     },
     "type": "subscription_schedule.created",
 }
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED["data"]["object"]["status"] = "active"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED["data"]["object"]["current_phase"][
+    "start_data"
+] = 1602464974
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED["data"]["object"]["current_phase"][
+    "end_data"
+] = 1605056974
+
 
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_UPDATED = deepcopy(
     FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED
 )
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_UPDATED["id"] = "sub_sched_1Hm86MFz0jfFqjGsc5iEdZee"
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_UPDATED["type"] = "subscription_schedule.updated"
-# FAKE_EVENT_SUBSCRIPTION_SCHEDULE_UPDATED["data"]["object"]["released_at"] = 1605058030
-# FAKE_EVENT_SUBSCRIPTION_SCHEDULE_UPDATED["data"]["object"]["status"] = "released"
-# FAKE_EVENT_SUBSCRIPTION_SCHEDULE_UPDATED["data"]["previous_attributes"] = {
-#     "released_at": None,
-#     "status": "not_started",
-# }
+
 
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_RELEASED = deepcopy(
     FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED
@@ -2107,6 +2411,39 @@ FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CANCELED["type"] = "subscription_schedule.cance
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CANCELED["data"]["object"]["canceled_at"] = 1605057622
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CANCELED["data"]["object"]["status"] = "canceled"
 FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CANCELED["data"]["previous_attributes"] = {
+    "released_at": None,
+    "status": "not_started",
+}
+
+
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_COMPLETED = deepcopy(
+    FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED
+)
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_COMPLETED["id"] = "evt_1Hm80YFz0jfFqjGs7kKvT7RE"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_COMPLETED["type"] = "subscription_schedule.completed"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_COMPLETED["data"]["object"]["completed_at"] = (
+    1605057622
+)
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_COMPLETED["data"]["object"]["status"] = "completed"
+
+
+# would get emmited 7 days before the scheduled end_date
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_EXPIRING = deepcopy(
+    FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED
+)
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_EXPIRING["id"] = "evt_1Hm80YFz0jfFqjGs7kKvT7RE"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_EXPIRING["type"] = "subscription_schedule.expiring"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_EXPIRING["created"] = 1602464900
+
+
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_ABORTED = deepcopy(
+    FAKE_EVENT_SUBSCRIPTION_SCHEDULE_CREATED
+)
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_ABORTED["id"] = "evt_1Hm80YFz0jfFqjGs7kKvT7RE"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_ABORTED["type"] = "subscription_schedule.aborted"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_ABORTED["data"]["object"]["canceled_at"] = 1605057622
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_ABORTED["data"]["object"]["status"] = "canceled"
+FAKE_EVENT_SUBSCRIPTION_SCHEDULE_ABORTED["data"]["previous_attributes"] = {
     "released_at": None,
     "status": "not_started",
 }

@@ -1,6 +1,7 @@
 """
 dj-stripe Settings Tests.
 """
+
 from unittest.mock import patch
 
 import stripe
@@ -51,8 +52,10 @@ class TestSubscriberModelRetrievalMethod(TestCase):
     def test_unknown_model(self):
         self.assertRaisesMessage(
             ImproperlyConfigured,
-            "DJSTRIPE_SUBSCRIBER_MODEL refers to model 'testapp.UnknownModel' "
-            "that has not been installed.",
+            (
+                "DJSTRIPE_SUBSCRIBER_MODEL refers to model 'testapp.UnknownModel' "
+                "that has not been installed."
+            ),
             settings.djstripe_settings.get_subscriber_model,
         )
 
@@ -71,8 +74,10 @@ class TestSubscriberModelRetrievalMethod(TestCase):
     def test_no_callback(self):
         self.assertRaisesMessage(
             ImproperlyConfigured,
-            "DJSTRIPE_SUBSCRIBER_MODEL_REQUEST_CALLBACK must be implemented "
-            "if a DJSTRIPE_SUBSCRIBER_MODEL is defined.",
+            (
+                "DJSTRIPE_SUBSCRIBER_MODEL_REQUEST_CALLBACK must be implemented "
+                "if a DJSTRIPE_SUBSCRIBER_MODEL is defined."
+            ),
             settings.djstripe_settings.get_subscriber_model,
         )
 
@@ -121,39 +126,27 @@ class TestSubscriberModelRetrievalMethod(TestCase):
             settings.djstripe_settings.get_callback_function("DJSTRIPE_TEST_CALLBACK")
 
 
+@override_settings(STRIPE_API_VERSION="2016-03-07")
+class TestStripeApiVersion(TestCase):
+    def test_global_stripe_api_version(self):
+        """Test that stripe.api_version is untouched.
+
+        See https://github.com/dj-stripe/dj-stripe/issues/1854
+        """
+        assert stripe.api_version is None
+
+
 @override_settings(STRIPE_API_VERSION=None)
 class TestGetStripeApiVersion(TestCase):
     def test_with_default(self):
         self.assertEqual(
             settings.djstripe_settings.DEFAULT_STRIPE_API_VERSION,
-            settings.djstripe_settings.get_stripe_api_version(),
+            settings.djstripe_settings.STRIPE_API_VERSION,
         )
 
     @override_settings(STRIPE_API_VERSION="2016-03-07")
     def test_with_override(self):
         self.assertEqual(
-            "2016-03-07", settings.djstripe_settings.get_stripe_api_version()
+            "2016-03-07",
+            settings.djstripe_settings.STRIPE_API_VERSION,
         )
-
-
-@override_settings(STRIPE_API_VERSION=None)
-class TestSetStripeApiVersion(TestCase):
-    def test_with_default(self):
-        settings.djstripe_settings.set_stripe_api_version()
-        self.assertEqual(
-            settings.djstripe_settings.DEFAULT_STRIPE_API_VERSION, stripe.api_version
-        )
-
-    def test_with_valid_date(self):
-        settings.djstripe_settings.set_stripe_api_version(version="2016-03-07")
-        self.assertEqual("2016-03-07", stripe.api_version)
-
-    def test_with_invalid_date(self):
-        with self.assertRaises(ValueError):
-            settings.djstripe_settings.set_stripe_api_version(version="foobar")
-
-    def test_with_invalid_date_and_no_validation(self):
-        settings.djstripe_settings.set_stripe_api_version(
-            version="foobar", validate=False
-        )
-        self.assertEqual("foobar", stripe.api_version)

@@ -1,7 +1,7 @@
 """
 dj-stripe PaymenthMethod Model Tests.
 """
-import sys
+
 from copy import deepcopy
 from unittest.mock import patch
 
@@ -9,7 +9,7 @@ import pytest
 import stripe
 from django.contrib.auth import get_user_model
 from django.test import TestCase
-from stripe.error import InvalidRequestError
+from stripe import InvalidRequestError
 
 from djstripe import enums, models
 
@@ -17,44 +17,88 @@ from . import (
     FAKE_CARD_AS_PAYMENT_METHOD,
     FAKE_CUSTOMER,
     FAKE_PAYMENT_METHOD_I,
-    FAKE_STANDARD_ACCOUNT,
-    IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
     AssertStripeFksMixin,
     PaymentMethodDict,
 )
+from .conftest import CreateAccountMixin
 
 pytestmark = pytest.mark.django_db
 
 
-@pytest.mark.parametrize("customer_exists", [True, False])
-def test___str__(customer_exists, monkeypatch):
+class TestPaymentMethod(CreateAccountMixin):
+    #
+    # Helper Methods for monkeypatching
+    #
+
     def mock_customer_get(*args, **kwargs):
         return deepcopy(FAKE_CUSTOMER)
 
-    # monkeypatch stripe.Customer.retrieve call to return
-    # the desired json response.
-    monkeypatch.setattr(stripe.Customer, "retrieve", mock_customer_get)
+    @pytest.mark.parametrize("customer_exists", [True, False])
+    def test___str__(self, monkeypatch, customer_exists):
+        # monkeypatch stripe.Customer.retrieve call to return
+        # the desired json response.
+        monkeypatch.setattr(stripe.Customer, "retrieve", self.mock_customer_get)
 
-    fake_payment_method_data = deepcopy(FAKE_PAYMENT_METHOD_I)
-    if not customer_exists:
-        fake_payment_method_data["customer"] = None
+        fake_payment_method_data = deepcopy(FAKE_PAYMENT_METHOD_I)
+        if not customer_exists:
+            fake_payment_method_data["customer"] = None
+            pm = models.PaymentMethod.sync_from_stripe_data(fake_payment_method_data)
+            customer = None
+            assert (
+                f"{enums.PaymentMethodType.humanize(fake_payment_method_data['type'])}"
+                f"ending in {fake_payment_method_data['card']['last4']} is not associated with any customer"
+                == str(pm)
+            )
+
+        else:
+            pm = models.PaymentMethod.sync_from_stripe_data(fake_payment_method_data)
+            customer = models.Customer.objects.get(
+                id=fake_payment_method_data["customer"]
+            )
+            assert (
+                f"{enums.PaymentMethodType.humanize(fake_payment_method_data['type'])}"
+                f"ending in {fake_payment_method_data['card']['last4']} for {customer}"
+                == str(pm)
+            )
+
+    @pytest.mark.parametrize("customer_exists", [True, False])
+    def test_get_stripe_dashboard_url(self, monkeypatch, customer_exists):
+        # monkeypatch stripe.Customer.retrieve call to return
+        # the desired json response.
+        monkeypatch.setattr(stripe.Customer, "retrieve", self.mock_customer_get)
+
+        fake_payment_method_data = deepcopy(FAKE_PAYMENT_METHOD_I)
+        if not customer_exists:
+            fake_payment_method_data["customer"] = None
+            pm = models.PaymentMethod.sync_from_stripe_data(fake_payment_method_data)
+            assert pm
+            assert pm.get_stripe_dashboard_url() == ""
+
+        else:
+            pm = models.PaymentMethod.sync_from_stripe_data(fake_payment_method_data)
+            assert pm
+            customer = models.Customer.objects.get(
+                id=fake_payment_method_data["customer"]
+            )
+            assert pm.get_stripe_dashboard_url() == customer.get_stripe_dashboard_url()
+
+    @pytest.mark.parametrize("customer_exists", [True, False])
+    def test_sync_from_stripe_data(self, monkeypatch, customer_exists):
+        # monkeypatch stripe.Customer.retrieve call to return
+        # the desired json response.
+        monkeypatch.setattr(stripe.Customer, "retrieve", self.mock_customer_get)
+
+        fake_payment_method_data = deepcopy(FAKE_PAYMENT_METHOD_I)
+        if not customer_exists:
+            fake_payment_method_data["customer"] = None
+
         pm = models.PaymentMethod.sync_from_stripe_data(fake_payment_method_data)
-        customer = None
-        assert (
-            f"{enums.PaymentMethodType.humanize(fake_payment_method_data['type'])} is not associated with any customer"
-        ) == str(pm)
-
-    else:
-        pm = models.PaymentMethod.sync_from_stripe_data(fake_payment_method_data)
-        customer = models.Customer.objects.get(id=fake_payment_method_data["customer"])
-        assert (
-            f"{enums.PaymentMethodType.humanize(fake_payment_method_data['type'])} for {customer}"
-        ) == str(pm)
+        assert pm
+        assert pm.id == fake_payment_method_data["id"]
 
 
-class PaymentMethodTest(AssertStripeFksMixin, TestCase):
+class PaymentMethodTest(CreateAccountMixin, AssertStripeFksMixin, TestCase):
     def setUp(self):
-        self.account = FAKE_STANDARD_ACCOUNT.create()
         user = get_user_model().objects.create_user(
             username="testuser", email="djstripe@example.com"
         )
@@ -68,10 +112,9 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.PaymentMethod._cls_attach",
         return_value=deepcopy(FAKE_PAYMENT_METHOD_I),
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     def test_attach(self, attach_mock):
-
         payment_method = models.PaymentMethod.attach(
             FAKE_PAYMENT_METHOD_I["id"], customer=FAKE_CUSTOMER["id"]
         )
@@ -87,10 +130,11 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.PaymentMethod._cls_attach",
         return_value=deepcopy(FAKE_PAYMENT_METHOD_I),
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     def test_attach_obj(self, attach_mock):
         pm = models.PaymentMethod.sync_from_stripe_data(FAKE_PAYMENT_METHOD_I)
+        assert pm
 
         payment_method = models.PaymentMethod.attach(pm, customer=self.customer)
 
@@ -105,13 +149,14 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.PaymentMethod._cls_attach",
         return_value=deepcopy(FAKE_PAYMENT_METHOD_I),
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     def test_attach_synced(self, attach_mock):
         fake_payment_method = deepcopy(FAKE_PAYMENT_METHOD_I)
         fake_payment_method["customer"] = None
 
         payment_method = models.PaymentMethod.sync_from_stripe_data(fake_payment_method)
+        assert payment_method
 
         self.assert_fks(
             payment_method, expected_blank_fks={"djstripe.PaymentMethod.customer"}
@@ -142,6 +187,7 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
         ):
             models.PaymentMethod.sync_from_stripe_data(deepcopy(FAKE_PAYMENT_METHOD_I))
 
+        assert self.customer
         self.assertEqual(1, self.customer.payment_methods.count())
 
         payment_method = self.customer.payment_methods.first()
@@ -160,10 +206,7 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
 
         self.assertIsNone(payment_method.customer)
 
-        if sys.version_info >= (3, 6):
-            # this mock isn't working on py34, py35, but it's not strictly necessary
-            # for the test
-            mock_detach.assert_called()
+        mock_detach.assert_called()
 
         self.assert_fks(
             payment_method, expected_blank_fks={"djstripe.PaymentMethod.customer"}
@@ -172,8 +215,10 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
         with patch(
             "tests.PaymentMethodDict.detach",
             side_effect=InvalidRequestError(
-                message="A source must be attached to a customer to be used "
-                "as a `payment_method`",
+                message=(
+                    "A source must be attached to a customer to be used "
+                    "as a `payment_method`"
+                ),
                 param="payment_method",
             ),
             autospec=True,
@@ -183,7 +228,10 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
             autospec=True,
         ) as payment_method_retrieve_mock:
             payment_method_retrieve_mock.return_value["customer"] = None
-
+            # Need to re-sync as the PaymentMethod object has been deleted
+            models.PaymentMethod.sync_from_stripe_data(
+                deepcopy(FAKE_CARD_AS_PAYMENT_METHOD)
+            )
             self.assertFalse(
                 payment_method.detach(), "Second call to detach should return false"
             )
@@ -210,7 +258,8 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
                 deepcopy(FAKE_CARD_AS_PAYMENT_METHOD)
             )
 
-        self.assertEqual(1, self.customer.payment_methods.count())
+        assert self.customer
+        assert self.customer.payment_methods.count() == 1
 
         payment_method = self.customer.payment_methods.first()
 
@@ -227,8 +276,8 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
         ):
             self.assertTrue(payment_method.detach())
 
-        self.assertEqual(0, self.customer.payment_methods.count())
-        self.assertIsNone(self.customer.default_payment_method)
+        assert self.customer.payment_methods.count() == 0
+        assert self.customer.default_payment_method is None
 
         self.assertEqual(
             models.PaymentMethod.objects.filter(id=payment_method.id).count(),
@@ -236,16 +285,15 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
             "We expect PaymentMethod id = card_* to be deleted",
         )
 
-        if sys.version_info >= (3, 6):
-            # this mock isn't working on py34, py35, but it's not strictly necessary
-            # for the test
-            mock_detach.assert_called()
+        mock_detach.assert_called()
 
         with patch(
             "tests.PaymentMethodDict.detach",
             side_effect=InvalidRequestError(
-                message="A source must be attached to a customer to be used "
-                "as a `payment_method`",
+                message=(
+                    "A source must be attached to a customer to be used "
+                    "as a `payment_method`"
+                ),
                 param="payment_method",
             ),
             autospec=True,
@@ -255,7 +303,14 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
             autospec=True,
         ) as payment_method_retrieve_mock:
             payment_method_retrieve_mock.return_value["customer"] = None
-
+            # Need to re-sync as the PaymentMethod object has been deleted
+            models.PaymentMethod.sync_from_stripe_data(
+                deepcopy(FAKE_CARD_AS_PAYMENT_METHOD)
+            )
+            # Get the Payment Method from the DB
+            payment_method = models.PaymentMethod.objects.filter(
+                id=payment_method.id
+            ).first()
             self.assertFalse(
                 payment_method.detach(), "Second call to detach should return false"
             )
@@ -264,6 +319,7 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
         payment_method = models.PaymentMethod.sync_from_stripe_data(
             deepcopy(FAKE_PAYMENT_METHOD_I)
         )
+        assert payment_method
 
         self.assertIsNotNone(payment_method.customer)
 
@@ -274,6 +330,7 @@ class PaymentMethodTest(AssertStripeFksMixin, TestCase):
         payment_method = models.PaymentMethod.sync_from_stripe_data(
             fake_payment_method_no_customer
         )
+        assert payment_method
 
         self.assertIsNone(payment_method.customer)
 

@@ -1,38 +1,41 @@
 """
 dj-stripe settings
 """
+
 import stripe
 from django.apps import apps as django_apps
 from django.conf import settings
 from django.core.exceptions import ImproperlyConfigured
 from django.utils.module_loading import import_string
 
-from .checks import validate_stripe_api_version
-
 
 class DjstripeSettings:
+    """Container for Dj-stripe settings
+
+    :return: Initialised settings for Dj-stripe.
+    :rtype: object
+
+    """
 
     DEFAULT_STRIPE_API_VERSION = "2020-08-27"
 
-    ZERO_DECIMAL_CURRENCIES = set(
-        [
-            "bif",
-            "clp",
-            "djf",
-            "gnf",
-            "jpy",
-            "kmf",
-            "krw",
-            "mga",
-            "pyg",
-            "rwf",
-            "vnd",
-            "vuv",
-            "xaf",
-            "xof",
-            "xpf",
-        ]
-    )
+    ZERO_DECIMAL_CURRENCIES = {
+        "bif",
+        "clp",
+        "djf",
+        "gnf",
+        "jpy",
+        "kmf",
+        "krw",
+        "mga",
+        "pyg",
+        "rwf",
+        "vnd",
+        "vuv",
+        "xaf",
+        "xof",
+        "xpf",
+    }
 
     def __init__(self):
         # Set STRIPE_API_HOST if you want to use a different Stripe API server
@@ -42,18 +45,10 @@ class DjstripeSettings:
 
     # generic setter and deleter methods to ensure object patching works
     def __setattr__(self, name, value):
-        self.__dict__["name"] = value
+        self.__dict__[name] = value
 
     def __delattr__(self, name):
-        del self.__dict__["name"]
-
-    @property
-    def SUBSCRIPTION_REDIRECT(self):
-        return getattr(settings, "DJSTRIPE_SUBSCRIPTION_REDIRECT", "")
-
-    @property
-    def SUBSCRIPTION_REQUIRED_EXCEPTION_URLS(self):
-        return getattr(settings, "DJSTRIPE_SUBSCRIPTION_REQUIRED_EXCEPTION_URLS", ())
+        del self.__dict__[name]
 
     @property
     def subscriber_request_callback(self):
@@ -69,34 +64,12 @@ class DjstripeSettings:
         )
 
     @property
-    def USE_NATIVE_JSONFIELD(self):
-        return getattr(settings, "DJSTRIPE_USE_NATIVE_JSONFIELD", False)
+    def decimal_max_digits(self):
+        return 24
 
     @property
-    def PRORATION_POLICY(self):
-        return getattr(settings, "DJSTRIPE_PRORATION_POLICY", False)
-
-    @property
-    def CANCELLATION_AT_PERIOD_END(self):
-        return not getattr(settings, "DJSTRIPE_PRORATION_POLICY", False)
-
-    @property
-    def DJSTRIPE_WEBHOOK_URL(self):
-        return getattr(settings, "DJSTRIPE_WEBHOOK_URL", r"^webhook/$")
-
-    @property
-    def WEBHOOK_TOLERANCE(self):
-        return getattr(
-            settings, "DJSTRIPE_WEBHOOK_TOLERANCE", stripe.Webhook.DEFAULT_TOLERANCE
-        )
-
-    @property
-    def WEBHOOK_VALIDATION(self):
-        return getattr(settings, "DJSTRIPE_WEBHOOK_VALIDATION", "verify_signature")
-
-    @property
-    def WEBHOOK_SECRET(self):
-        return getattr(settings, "DJSTRIPE_WEBHOOK_SECRET", "")
+    def decimal_places(self):
+        return 12
 
     # Webhook event callbacks allow an application to take control of what happens
     # when an event from Stripe is received.  One suggestion is to put the event
@@ -137,7 +110,6 @@ class DjstripeSettings:
 
     @property
     def STRIPE_PUBLIC_KEY(self):
-
         # Default public key
         if hasattr(settings, "STRIPE_PUBLIC_KEY"):
             STRIPE_PUBLIC_KEY = settings.STRIPE_PUBLIC_KEY
@@ -146,6 +118,14 @@ class DjstripeSettings:
         else:
             STRIPE_PUBLIC_KEY = getattr(settings, "STRIPE_TEST_PUBLIC_KEY", "")
         return STRIPE_PUBLIC_KEY
+
+    @property
+    def STRIPE_API_VERSION(self) -> str:
+        """
+        Get the desired API version to use for Stripe requests.
+        """
+        version = getattr(settings, "STRIPE_API_VERSION", stripe.api_version)
+        return version or self.DEFAULT_STRIPE_API_VERSION
 
     def get_callback_function(self, setting_name, default=None):
         """
@@ -174,22 +154,20 @@ class DjstripeSettings:
             func = import_string(func)
 
         if not callable(func):
-            raise ImproperlyConfigured(
-                "{name} must be callable.".format(name=setting_name)
-            )
+            raise ImproperlyConfigured(f"{setting_name} must be callable.")
 
         return func
 
-    def _get_idempotency_key(self, object_type, action, livemode):
+    def _get_idempotency_key(self, object_type, action, livemode: bool | None) -> str:
         from .models import IdempotencyKey
 
-        action = "{}:{}".format(object_type, action)
+        action = f"{object_type}:{action}"
         idempotency_key, _created = IdempotencyKey.objects.get_or_create(
             action=action, livemode=livemode
         )
         return str(idempotency_key.uuid)
 
-    def get_default_api_key(self, livemode):
+    def get_default_api_key(self, livemode: bool | None) -> str:
         """
         Returns the default API key for a value of `livemode`.
         """
@@ -203,9 +181,9 @@ class DjstripeSettings:
             # Livemode is false, use the test secret key
             return self.TEST_API_KEY or self.STRIPE_SECRET_KEY
 
-    def get_subscriber_model_string(self):
+    def get_subscriber_model_string(self) -> str:
         """Get the configured subscriber model as a module path string."""
-        return getattr(settings, "DJSTRIPE_SUBSCRIBER_MODEL", settings.AUTH_USER_MODEL)
+        return getattr(settings, "DJSTRIPE_SUBSCRIBER_MODEL", settings.AUTH_USER_MODEL)  # type: ignore
 
     def get_subscriber_model(self):
         """
@@ -229,8 +207,8 @@ class DjstripeSettings:
             )
         except LookupError:
             raise ImproperlyConfigured(
-                "DJSTRIPE_SUBSCRIBER_MODEL refers to model '{model}' "
-                "that has not been installed.".format(model=model_name)
+                f"DJSTRIPE_SUBSCRIBER_MODEL refers to model '{model_name}' "
+                "that has not been installed."
             )
 
         if (
@@ -241,43 +219,7 @@ class DjstripeSettings:
                 "DJSTRIPE_SUBSCRIBER_MODEL must have an email attribute."
             )
 
-        if model_name != settings.AUTH_USER_MODEL:
-            # Custom user model detected. Make sure the callback is configured.
-            func = self.get_callback_function(
-                "DJSTRIPE_SUBSCRIBER_MODEL_REQUEST_CALLBACK"
-            )
-            if not func:
-                raise ImproperlyConfigured(
-                    "DJSTRIPE_SUBSCRIBER_MODEL_REQUEST_CALLBACK must be implemented "
-                    "if a DJSTRIPE_SUBSCRIBER_MODEL is defined."
-                )
-
         return subscriber_model
-
-    # TODO convert to STRIPE_API_VERSION property
-    def get_stripe_api_version(self):
-        """Get the desired API version to use for Stripe requests."""
-        version = getattr(settings, "STRIPE_API_VERSION", stripe.api_version)
-        return version or self.DEFAULT_STRIPE_API_VERSION
-
-    # TODO convert to setter for STRIPE_API_VERSION property
-    def set_stripe_api_version(self, version=None, validate=True):
-        """
-        Set the desired API version to use for Stripe requests.
-
-        :param version: The version to set for the Stripe API.
-        :type version: ``str``
-        :param validate: If True validate the value for the specified version).
-        :type validate: ``bool``
-        """
-        version = version or self.get_stripe_api_version()
-
-        if validate:
-            valid = validate_stripe_api_version(version)
-            if not valid:
-                raise ValueError("Bad stripe API version: {}".format(version))
-
-        stripe.api_version = version
 
 
 # initialise the settings object

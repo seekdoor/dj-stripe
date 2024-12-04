@@ -1,15 +1,14 @@
 import json
 from copy import deepcopy
-from typing import Dict, List, Set, Type
 
-import stripe.api_resources
-import stripe.stripe_object
+import stripe
 from django.core.management import BaseCommand
-from stripe.error import InvalidRequestError
+from stripe import InvalidRequestError, ListObject, StripeObject
 
 import djstripe.models
 import tests
-from djstripe.settings import djstripe_settings
+from djstripe import settings as djstripe_settings
+from djstripe.utils import get_id_from_stripe_data
 
 """
 Key used to store fake ids in the real stripe object's metadata dict
@@ -279,7 +278,7 @@ class Command(BaseCommand):
                 if path in paths:
                     continue
                 else:
-                    self.stdout.write("deleting {}".format(path))
+                    self.stdout.write(f"deleting {path!r}")
                     path.unlink()
 
     def init_fake_id_map(self):
@@ -330,7 +329,7 @@ class Command(BaseCommand):
             if fake_id in self.fake_id_map:
                 assert self.fake_id_map[fake_id] == actual_id, (
                     f"Duplicate fake_id {fake_id} - reset your test Stripe data at "
-                    f"https://dashboard.stripe.com/account/data"
+                    "https://dashboard.stripe.com/account/data"
                 )
 
             self.fake_id_map[fake_id] = actual_id
@@ -362,7 +361,7 @@ class Command(BaseCommand):
             # source charge (etc)
             fake_source_id = self.get_fake_id(obj["source"])
 
-            fake_id = "txn_fake_{}".format(fake_source_id)
+            fake_id = f"txn_fake_{fake_source_id}"
 
         return fake_id
 
@@ -398,7 +397,7 @@ class Command(BaseCommand):
 
         return json_str
 
-    def update_fixture_obj(  # noqa: C901
+    def update_fixture_obj(
         self,
         old_obj,
         model_class,
@@ -435,10 +434,6 @@ class Command(BaseCommand):
             )
         elif issubclass(model_class, djstripe.models.Card):
             created, obj = self.get_or_create_stripe_card(
-                old_obj=old_obj, readonly_fields=readonly_fields
-            )
-        elif issubclass(model_class, djstripe.models.Source):
-            created, obj = self.get_or_create_stripe_source(
                 old_obj=old_obj, readonly_fields=readonly_fields
             )
         elif issubclass(model_class, djstripe.models.Invoice):
@@ -682,7 +677,7 @@ class Command(BaseCommand):
             stripe.PaymentMethod.attach(
                 obj["id"],
                 customer=customer_id,
-                api_key=djstripe_settings.STRIPE_SECRET_KEY,
+                api_key=djstripe_settings.djstripe_settings.STRIPE_SECRET_KEY,
             )
 
             for k in writable_fields:
@@ -703,9 +698,7 @@ class Command(BaseCommand):
 
         if source.startswith("ch_"):
             charge = djstripe.models.Charge(id=source).api_retrieve()
-            id_ = djstripe.models.StripeModel._id_from_data(
-                charge["balance_transaction"]
-            )
+            id_ = get_id_from_stripe_data(charge["balance_transaction"])
 
         try:
             obj = djstripe.models.BalanceTransaction(id=id_).api_retrieve()
@@ -757,14 +750,11 @@ class Command(BaseCommand):
                     if k in subscription_item_create_fields
                 }
 
-                create_item["plan"] = djstripe.models.StripeModel._id_from_data(
-                    create_item["plan"]
-                )
+                create_item["plan"] = get_id_from_stripe_data(create_item["plan"])
 
                 if create_item.get("tax_rates", []):
                     create_item["tax_rates"] = [
-                        djstripe.models.StripeModel._id_from_data(t)
-                        for t in create_item["tax_rates"]
+                        get_id_from_stripe_data(t) for t in create_item["tax_rates"]
                     ]
 
                 create_items.append(create_item)
@@ -773,14 +763,11 @@ class Command(BaseCommand):
         else:
             # don't try and send empty items list
             create_obj.pop("items", None)
-            create_obj["plan"] = djstripe.models.StripeModel._id_from_data(
-                create_obj["plan"]
-            )
+            create_obj["plan"] = get_id_from_stripe_data(create_obj["plan"])
 
         if create_obj.get("default_tax_rates", []):
             create_obj["default_tax_rates"] = [
-                djstripe.models.StripeModel._id_from_data(t)
-                for t in create_obj["default_tax_rates"]
+                get_id_from_stripe_data(t) for t in create_obj["default_tax_rates"]
             ]
 
             # don't send both default_tax_rates and tax_percent
@@ -808,7 +795,7 @@ class Command(BaseCommand):
             except KeyError:
                 continue
 
-            if isinstance(new_val, stripe.api_resources.ListObject):
+            if isinstance(new_val, ListObject):
                 # recursively process nested lists
                 for n, (old_val_item, new_val_item) in enumerate(
                     zip(old_val.get("data", []), new_val.data)
@@ -819,7 +806,7 @@ class Command(BaseCommand):
                         object_sideeffect_fields=object_sideeffect_fields,
                         common_sideeffect_fields=common_sideeffect_fields,
                     )
-            elif isinstance(new_val, stripe.stripe_object.StripeObject):
+            elif isinstance(new_val, StripeObject):
                 # recursively process nested objects
                 new_obj[f] = self.preserve_old_sideeffect_values(
                     old_obj=old_val,
@@ -829,7 +816,7 @@ class Command(BaseCommand):
                 )
             elif (
                 f in sideeffect_fields
-                and type(old_val) == type(new_val)
+                and type(old_val) is type(new_val)
                 and old_val != new_val
             ):
                 # only preserve old values if the type is the same

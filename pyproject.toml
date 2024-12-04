@@ -1,16 +1,16 @@
 [tool.poetry]
 name = "dj-stripe"
-version = "2.5.1"
+version = "2.8.0"
 description = "Django + Stripe made easy"
 license = "MIT"
 authors = [
     "Alexander Kavanaugh <alex@kavdev.io>",
     "Jerome Leclanche <jerome@leclan.ch>",
-    "John Carter <john@therefromhere.org>",
 ]
-readme = "README.md"
+readme = "docs/README.md"
+homepage = "https://dj-stripe.dev"
 repository = "https://github.com/dj-stripe/dj-stripe"
-documentation = "https://dj-stripe.readthedocs.io/"
+documentation = "https://dj-stripe.dev/docs"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Environment :: Web Environment",
@@ -18,48 +18,103 @@ classifiers = [
     "Topic :: Office/Business :: Financial",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Framework :: Django",
-    "Framework :: Django :: 2.2",
-    "Framework :: Django :: 3.1",
-    "Framework :: Django :: 3.2",
+    "Framework :: Django :: 5.0",
+    "Framework :: Django :: 5.1",
 ]
 
-packages = [
-    { include = "djstripe" }
-]
-include = [
-    "AUTHORS.md",
-    "CONTRIBUTING.md",
-    "HISTORY.md",
-    "LICENSE",
-]
-exclude = [
-    "manage.py"
-]
+packages = [{ include = "djstripe" }]
+include = ["AUTHORS.md", "CONTRIBUTING.md", "HISTORY.md", "LICENSE"]
+exclude = ["manage.py"]
+
+[tool.poetry.urls]
+"Funding" = "https://github.com/sponsors/dj-stripe"
+
 
 [tool.poetry.dependencies]
-python = "^3.6.2"
-Django = ">=2.2"
-jsonfield = ">=3.0"
-stripe = ">=2.48.0"
-mkdocs = {version = "^1.1.2", optional = true}
-mkautodoc = {version = "^0.1.0", optional = true}
+python = "^3.10.0"
+django = ">=5.0"
+stripe = ">=11.3.0"
+psycopg = { version = "^3.2.3", optional = true }
+mysqlclient = { version = ">=1.4.0", optional = true }
 
-[tool.poetry.dev-dependencies]
-black = "^21.5b1"
-djangorestframework = "^3.11.0"
-psycopg2 = "^2.8.5"
-flake8 = "^3.9.2"
-isort = "^5.8.0"
-pytest = "^6.2.4"
-pytest-django = "^4.3.0"
-mypy = "^0.812"
+[tool.poetry.group.dev]
+optional = true
+[tool.poetry.group.dev.dependencies]
+mypy = ">=1.13.0"
+pre-commit = "^4.0.1"
+pytest = ">=8.3.4"
+pytest-django = ">=4.9.0"
+ruff = "^0.8.1"
+
+[tool.poetry.group.docs]
+optional = true
+[tool.poetry.group.docs.dependencies]
+mkdocs = "^1.6.1"
+mkdocs-material = "^9.5.47"
+mkdocs-autorefs = "^1.2.0"
+mkdocstrings = { extras = ["python"], version = "^0.27.0" }
+mike = "^2.1.3"
+jinja2 = "^3.1.4"
+
+[tool.poetry.group.ci]
+optional = true
+[tool.poetry.group.ci.dependencies]
+coverage = { version = "^7.6.8", extras = ["toml"] }
+tox = "^4.23.2"
+tox-gh = "^1.4.4"
 
 [tool.poetry.extras]
-docs = ["mkdocs", "mkautodoc"]
-
-[tool.isort]
-profile = "black"
+postgres = ["psycopg"]
+mysql = ["mysqlclient"]
 
 [build-system]
-requires = ["poetry>=1.0.4"]
-build-backend = "poetry.masonry.api"
+requires = ["poetry_core>=1.1.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.tox]
+isolated_build = true
+envlist = [
+    "django{50,51}-py{310,311,312,313}-{postgres,sqlite}",
+    "djangomain-py313-postgres",
+]
+skip_missing_interpreters = true
+
+[tool.tox.gh.python]
+"3.13" = ["py313"]
+"3.12" = ["py312"]
+"3.11" = ["py311"]
+"3.10" = ["py310"]
+
+[tool.tox.testenv]
+passenv = ["DJSTRIPE_*"]
+
+commands = ["pytest {posargs}"]
+deps = [
+    "pytest-django",
+    "pytest-cov",
+    "django50: Django>=5.0,<5.1",
+    "django51: Django>=5.1,<5.2",
+    "djangomain: https://github.com/django/django/archive/main.tar.gz",
+    "postgres: psycopg>=3.2.3",
+]
+
+[tool.tox.testenv.setenv]
+postgres = "DJSTRIPE_TEST_DB_VENDOR=postgres"
+sqlite = "DJSTRIPE_TEST_DB_VENDOR=sqlite"
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "tests.settings"
+markers = ["stripe_api: mark a test as using Stripe API."]
+
+[tool.coverage.run]
+branch = true
+source = ["djstripe"]
+omit = [
+    "djstripe/migrations/*",
+    "djstripe/management/*",
+    "djstripe/admin.py",
+    "djstripe/checks.py",
+]
+
+[tool.coverage.html]
+directory = "cover"

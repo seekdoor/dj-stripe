@@ -7,18 +7,24 @@ Wire this into the root URLConf this way::
     # url can be changed
     # Call to 'djstripe.urls' and 'namespace' must stay as is
 """
-from django.urls import re_path
+
+from django.conf import settings
+from django.urls import path
 
 from . import views
-from .settings import djstripe_settings as app_settings
 
 app_name = "djstripe"
 
+
+def trailing_slash(path: str) -> str:
+    return path + "/" if settings.APPEND_SLASH else path
+
+
 urlpatterns = [
     # Webhook
-    re_path(
-        app_settings.DJSTRIPE_WEBHOOK_URL,
+    path(
+        trailing_slash("webhook/<uuid:uuid>"),
         views.ProcessWebhookView.as_view(),
-        name="webhook",
-    )
+        name="djstripe_webhook_by_uuid",
+    ),
 ]

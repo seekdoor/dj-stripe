@@ -1,14 +1,15 @@
 """
 Customer Model Tests.
 """
+
 import decimal
 from copy import deepcopy
-from unittest.mock import ANY, patch
+from unittest.mock import ANY, call, patch
 
 from django.contrib.auth import get_user_model
 from django.test import TestCase, override_settings
 from django.utils import timezone
-from stripe.error import InvalidRequestError
+from stripe import InvalidRequestError
 
 from djstripe.exceptions import MultipleSubscriptionException
 from djstripe.models import (
@@ -17,7 +18,6 @@ from djstripe.models import (
     Coupon,
     Customer,
     DjstripePaymentMethod,
-    IdempotencyKey,
     Invoice,
     PaymentMethod,
     Plan,
@@ -25,18 +25,18 @@ from djstripe.models import (
     Product,
     Subscription,
 )
+from djstripe.models.payment_methods import Source
 from djstripe.settings import djstripe_settings
 
 from . import (
     FAKE_BALANCE_TRANSACTION,
+    FAKE_BALANCE_TRANSACTION_REFUND,
     FAKE_CARD,
     FAKE_CARD_AS_PAYMENT_METHOD,
-    FAKE_CARD_III,
     FAKE_CHARGE,
     FAKE_COUPON,
     FAKE_CUSTOMER,
     FAKE_CUSTOMER_II,
-    FAKE_CUSTOMER_III,
     FAKE_CUSTOMER_IV,
     FAKE_DISCOUNT_CUSTOMER,
     FAKE_INVOICE,
@@ -45,22 +45,27 @@ from . import (
     FAKE_PAYMENT_INTENT_I,
     FAKE_PAYMENT_METHOD_I,
     FAKE_PLAN,
+    FAKE_PLATFORM_ACCOUNT,
     FAKE_PRICE,
     FAKE_PRODUCT,
-    FAKE_SOURCE,
-    FAKE_STANDARD_ACCOUNT,
+    FAKE_REFUND,
+    FAKE_SOURCE_II,
     FAKE_SUBSCRIPTION,
     FAKE_SUBSCRIPTION_II,
+    FAKE_SUBSCRIPTION_ITEM,
     FAKE_UPCOMING_INVOICE,
-    IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
     AssertStripeFksMixin,
     StripeList,
     datetime_to_unix,
 )
+from .conftest import CreateAccountMixin
 
 
-class TestCustomer(AssertStripeFksMixin, TestCase):
+class TestCustomer(CreateAccountMixin, AssertStripeFksMixin, TestCase):
     def setUp(self):
+        # create a Stripe Platform Account
+        self.account = FAKE_PLATFORM_ACCOUNT.create()
+
         self.user = get_user_model().objects.create_user(
             username="pydanny", email="pydanny@gmail.com"
         )
@@ -73,8 +78,6 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
         self.customer.default_source = self.payment_method
         self.customer.save()
-
-        self.account = FAKE_STANDARD_ACCOUNT.create()
 
     def test___str__(self):
         self.assertEqual(str(self.customer), str(self.user))
@@ -96,15 +99,11 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self.assertEqual(self.customer.pending_charges, 0)
 
     def test_customer_dashboard_url(self):
-        expected_url = "https://dashboard.stripe.com/test/customers/{}".format(
-            self.customer.id
-        )
+        expected_url = f"https://dashboard.stripe.com/{self.customer.djstripe_owner_account.id}/test/customers/{self.customer.id}"
         self.assertEqual(self.customer.get_stripe_dashboard_url(), expected_url)
 
         self.customer.livemode = True
-        expected_url = "https://dashboard.stripe.com/customers/{}".format(
-            self.customer.id
-        )
+        expected_url = f"https://dashboard.stripe.com/{self.customer.djstripe_owner_account.id}/customers/{self.customer.id}"
         self.assertEqual(self.customer.get_stripe_dashboard_url(), expected_url)
 
         unsaved_customer = Customer()
@@ -119,12 +118,11 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         user = get_user_model().objects.create_user(
             username="test_user_sync_unsupported_source"
         )
-        synced_customer = fake_customer.create_for_user(user)
-        self.assertEqual(0, synced_customer.legacy_cards.count())
-        self.assertEqual(0, synced_customer.sources.count())
-        self.assertEqual(
-            synced_customer.default_source,
-            DjstripePaymentMethod.objects.get(id=fake_customer["default_source"]["id"]),
+        self.assertRaisesRegex(
+            ValueError,
+            "Trying to fit a 'fish' into 'Card'. Aborting.",
+            fake_customer.create_for_user,
+            user,
         )
 
     def test_customer_sync_has_subscriber_metadata(self):
@@ -196,9 +194,11 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         customer_mock.assert_called_once_with(
             api_key=djstripe_settings.STRIPE_SECRET_KEY,
             email="",
+            name="",
             idempotency_key=None,
             metadata={},
             stripe_account=None,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
         self.assertEqual(customer.metadata, None)
@@ -212,24 +212,46 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             },
         )
 
+    @patch.object(Card, "_get_or_create_from_stripe_object")
+    @patch("stripe.Customer.retrieve", autospec=True)
     @patch(
         "stripe.Card.retrieve",
-        return_value=FAKE_CUSTOMER_II["default_source"],
         autospec=True,
     )
-    def test_customer_sync_non_local_card(self, card_retrieve_mock):
+    def test_customer_sync_non_local_card(
+        self, card_retrieve_mock, customer_retrieve_mock, card_get_or_create_mock
+    ):
         fake_customer = deepcopy(FAKE_CUSTOMER_II)
-        fake_customer["id"] = fake_customer["sources"]["data"][0][
-            "customer"
-        ] = "cus_test_sync_non_local_card"
+        fake_customer["id"] = fake_customer["sources"]["data"][0]["customer"] = (
+            "cus_test_sync_non_local_card"
+        )
+        fake_customer["default_source"]["id"] = fake_customer["sources"]["data"][0][
+            "id"
+        ] = "card_cus_test_sync_non_local_card"
+
+        customer_retrieve_mock.return_value = fake_customer
+
+        fake_card = deepcopy(fake_customer["default_source"])
+        fake_card["customer"] = "cus_test_sync_non_local_card"
+        card_retrieve_mock.return_value = fake_card
+        card_get_or_create_mock.return_value = fake_card
 
         user = get_user_model().objects.create_user(
             username="test_user_sync_non_local_card"
         )
+
+        # create a source object so that FAKE_CUSTOMER_III with a default source
+        # can be created correctly.
+        fake_source_data = deepcopy(FAKE_SOURCE_II)
+        fake_source_data["card"] = deepcopy(fake_card)
+        fake_source_data["customer"] = fake_customer
+
+        Source.sync_from_stripe_data(fake_source_data)
+
         customer = fake_customer.create_for_user(user)
 
-        self.assertEqual(customer.sources.count(), 0)
-        self.assertEqual(customer.legacy_cards.count(), 1)
+        self.assertEqual(customer.sources.count(), 1)
+        self.assertEqual(customer.legacy_cards.count(), 0)
         self.assertEqual(
             customer.default_source.id, fake_customer["default_source"]["id"]
         )
@@ -246,6 +268,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         )
         customer = fake_customer.create_for_user(user)
 
+        self.assertEqual(customer.deleted, False)
         self.assertEqual(customer.sources.count(), 0)
         self.assertEqual(customer.legacy_cards.count(), 0)
         self.assertEqual(customer.bank_account.count(), 1)
@@ -294,12 +317,13 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     def test_customer_sync_default_source_string(self):
         Customer.objects.all().delete()
         Card.objects.all().delete()
+
         customer_fake = deepcopy(FAKE_CUSTOMER)
-        customer_fake["default_source"] = customer_fake["sources"]["data"][0][
-            "id"
-        ] = "card_sync_source_string"
+
         customer = Customer.sync_from_stripe_data(customer_fake)
-        self.assertEqual(customer.default_source.id, customer_fake["default_source"])
+        self.assertEqual(
+            customer.default_source.id, customer_fake["default_source"]["id"]
+        )
         self.assertEqual(customer.legacy_cards.count(), 2)
         self.assertEqual(len(list(customer.customer_payment_methods)), 2)
 
@@ -322,9 +346,9 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         Customer.objects.all().delete()
         PaymentMethod.objects.all().delete()
         customer_fake = deepcopy(FAKE_CUSTOMER)
-        customer_fake["invoice_settings"][
-            "default_payment_method"
-        ] = FAKE_PAYMENT_METHOD_I["id"]
+        customer_fake["invoice_settings"]["default_payment_method"] = (
+            FAKE_PAYMENT_METHOD_I["id"]
+        )
         customer_retrieve_mock.return_value = customer_fake
 
         customer = Customer.sync_from_stripe_data(customer_fake)
@@ -344,152 +368,63 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch("stripe.Customer.retrieve", autospec=True)
     @patch(
-        "stripe.Customer.retrieve_source",
-        side_effect=[deepcopy(FAKE_CARD), deepcopy(FAKE_CARD_III)],
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        "stripe.PaymentMethod.retrieve", return_value=deepcopy(FAKE_PAYMENT_METHOD_I)
     )
-    def test_customer_purge_leaves_customer_record(
-        self, customer_retrieve_source_mock, customer_retrieve_fake
+    def test_customer_sync_null_default_payment_method(
+        self, attach_mock, customer_retrieve_mock
     ):
-        self.customer.purge()
-        customer = Customer.objects.get(id=self.customer.id)
+        """Test to make sure a custom'er default_payment_method gets updated to None
+        if they remove their only attached payment method"""
+        Customer.objects.all().delete()
+        PaymentMethod.objects.all().delete()
 
-        self.assertTrue(customer.subscriber is None)
-        self.assertTrue(customer.default_source is None)
-        self.assertTrue(not customer.legacy_cards.all())
-        self.assertTrue(not customer.sources.all())
-        self.assertTrue(get_user_model().objects.filter(pk=self.user.pk).exists())
+        customer_fake = deepcopy(FAKE_CUSTOMER)
+        customer_fake["invoice_settings"]["default_payment_method"] = (
+            FAKE_PAYMENT_METHOD_I["id"]
+        )
+        customer_retrieve_mock.return_value = customer_fake
 
-    @patch("stripe.Customer.create", autospec=True)
-    def test_customer_purge_detaches_sources(self, customer_api_create_fake):
-        fake_customer = deepcopy(FAKE_CUSTOMER_III)
-        customer_api_create_fake.return_value = fake_customer
+        customer = Customer.sync_from_stripe_data(customer_fake)
+        self.assertEqual(
+            customer.default_payment_method.id,
+            customer_fake["invoice_settings"]["default_payment_method"],
+        )
+        self.assertEqual(customer.payment_methods.count(), 1)
 
-        user = get_user_model().objects.create_user(
-            username="blah", email=FAKE_CUSTOMER_III["email"]
+        self.assert_fks(
+            customer,
+            expected_blank_fks={
+                "djstripe.Customer.coupon",
+                "djstripe.Customer.subscriber",
+            },
         )
 
-        Customer.get_or_create(user)
-        customer = Customer.sync_from_stripe_data(deepcopy(FAKE_CUSTOMER_III))
+        # update customer_retrieve_mock return value
+        customer_fake = deepcopy(FAKE_CUSTOMER)
+        customer_fake["invoice_settings"]["default_payment_method"] = None
+        customer_retrieve_mock.return_value = customer_fake
 
-        self.assertIsNotNone(customer.default_source)
-        self.assertNotEqual(customer.sources.count(), 0)
+        # now detach the payment method from customer
+        is_detached = customer.default_payment_method.detach()
+        assert is_detached is True
 
-        with patch("stripe.Customer.retrieve", autospec=True), patch(
-            "stripe.Source.retrieve", return_value=deepcopy(FAKE_SOURCE), autospec=True
-        ):
-            customer.purge()
+        # refresh customer from db
+        customer.refresh_from_db()
 
-        self.assertIsNone(customer.default_source)
-        self.assertEqual(customer.sources.count(), 0)
-
-    @patch(
-        "stripe.Customer.create", return_value=deepcopy(FAKE_CUSTOMER_II), autospec=True
-    )
-    def test_customer_purge_deletes_idempotency_key(self, customer_api_create_fake):
-        # We need to call Customer.get_or_create (which setUp doesn't)
-        # to get an idempotency key
-        user = get_user_model().objects.create_user(
-            username="blah", email=FAKE_CUSTOMER_II["email"]
+        self.assertEqual(
+            customer.default_payment_method,
+            None,
         )
-        idempotency_key_action = "customer:create:{}".format(user.pk)
-        self.assertFalse(
-            IdempotencyKey.objects.filter(action=idempotency_key_action).exists()
+        self.assertEqual(customer.payment_methods.count(), 0)
+
+        self.assert_fks(
+            customer,
+            expected_blank_fks={
+                "djstripe.Customer.coupon",
+                "djstripe.Customer.subscriber",
+                "djstripe.Customer.default_payment_method",
+            },
         )
-
-        customer, created = Customer.get_or_create(user)
-        self.assertTrue(
-            IdempotencyKey.objects.filter(action=idempotency_key_action).exists()
-        )
-
-        with patch("stripe.Customer.retrieve", autospec=True):
-            customer.purge()
-
-        self.assertFalse(
-            IdempotencyKey.objects.filter(action=idempotency_key_action).exists()
-        )
-
-    @patch(
-        "stripe.Customer.retrieve",
-        side_effect=InvalidRequestError("No such customer:", "blah"),
-        autospec=True,
-    )
-    @patch(
-        "stripe.Customer.retrieve_source",
-        return_value=deepcopy(FAKE_CARD),
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
-    )
-    def test_customer_purge_raises_customer_exception(
-        self, customer_retrieve_source_mock, customer_retrieve_mock
-    ):
-
-        self.customer.purge()
-        customer = Customer.objects.get(id=self.customer.id)
-        self.assertTrue(customer.subscriber is None)
-        self.assertTrue(customer.default_source is None)
-        self.assertTrue(not customer.legacy_cards.all())
-        self.assertTrue(not customer.sources.all())
-        self.assertTrue(get_user_model().objects.filter(pk=self.user.pk).exists())
-
-        customer_retrieve_mock.assert_called_with(
-            id=self.customer.id,
-            api_key=djstripe_settings.STRIPE_SECRET_KEY,
-            expand=ANY,
-            stripe_account=None,
-        )
-        self.assertEqual(1, customer_retrieve_mock.call_count)
-
-        self.assertEqual(2, customer_retrieve_source_mock.call_count)
-
-    @patch("stripe.Customer.retrieve", autospec=True)
-    def test_customer_delete_raises_unexpected_exception(self, customer_retrieve_mock):
-        customer_retrieve_mock.side_effect = InvalidRequestError(
-            "Unexpected Exception", "blah"
-        )
-
-        with self.assertRaisesMessage(InvalidRequestError, "Unexpected Exception"):
-            self.customer.purge()
-
-        customer_retrieve_mock.assert_called_once_with(
-            id=self.customer.id,
-            api_key=djstripe_settings.STRIPE_SECRET_KEY,
-            expand=ANY,
-            stripe_account=None,
-        )
-
-    def test_can_charge(self):
-        self.assertTrue(self.customer.can_charge())
-
-    @patch(
-        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
-    )
-    def test_add_card_set_default_true(self, customer_retrieve_mock):
-        self.customer.add_card(FAKE_CARD["id"])
-        self.customer.add_card(FAKE_CARD_III["id"])
-
-        self.assertEqual(2, Card.objects.count())
-        self.assertEqual(FAKE_CARD_III["id"], self.customer.default_source.id)
-
-    @patch(
-        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
-    )
-    def test_add_card_set_default_false(self, customer_retrieve_mock):
-        self.customer.add_card(FAKE_CARD["id"], set_default=False)
-        self.customer.add_card(FAKE_CARD_III["id"], set_default=False)
-
-        self.assertEqual(2, Card.objects.count())
-        self.assertEqual(FAKE_CARD["id"], self.customer.default_source.id)
-
-    @patch(
-        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
-    )
-    def test_add_card_set_default_false_with_single_card_still_becomes_default(
-        self, customer_retrieve_mock
-    ):
-        self.customer.add_card(FAKE_CARD["id"], set_default=False)
-
-        self.assertEqual(2, Card.objects.count())
-        self.assertEqual(FAKE_CARD["id"], self.customer.default_source.id)
 
     @patch(
         "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
@@ -534,7 +469,6 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     def test_add_payment_method_set_default_true(
         self, attach_mock, customer_retrieve_mock
     ):
-        # clear default source so we can check can_charge()
         fake_customer = deepcopy(FAKE_CUSTOMER)
         fake_customer["default_source"] = None
         customer_retrieve_mock.return_value = fake_customer
@@ -572,11 +506,6 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             self.customer.invoice_settings["default_payment_method"],
         )
 
-        self.assertTrue(
-            self.customer.can_charge(),
-            "Expect to be able to charge since we've set a default_payment_method",
-        )
-
         self.assert_fks(
             self.customer,
             expected_blank_fks={
@@ -590,7 +519,6 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     def test_add_payment_method_set_default_false(
         self, attach_mock, customer_retrieve_mock
     ):
-        # clear default source so we can check can_charge()
         fake_customer = deepcopy(FAKE_CUSTOMER)
         fake_customer["default_source"] = None
         customer_retrieve_mock.return_value = fake_customer
@@ -618,12 +546,6 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             1,
         )
 
-        self.assertFalse(
-            self.customer.can_charge(),
-            "Expect not to be able to charge since we've not set a "
-            "default_payment_method",
-        )
-
         self.assert_fks(
             self.customer,
             expected_blank_fks={
@@ -632,13 +554,6 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
                 "djstripe.Customer.default_source",
             },
         )
-
-    @patch(
-        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
-    )
-    def test_cannot_charge(self, customer_retrieve_fake):
-        self.customer.date_purged = timezone.now()
-        self.assertFalse(self.customer.can_charge())
 
     def test_charge_accepts_only_decimals(self):
         with self.assertRaises(ValueError):
@@ -655,7 +570,8 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             api_key=djstripe_settings.STRIPE_SECRET_KEY,
             expand=ANY,
             id=FAKE_CUSTOMER["id"],
-            stripe_account=None,
+            stripe_account=self.customer.djstripe_owner_account.id,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
     @patch("stripe.Coupon.retrieve", return_value=deepcopy(FAKE_COUPON), autospec=True)
@@ -684,7 +600,8 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             api_key=djstripe_settings.STRIPE_SECRET_KEY,
             expand=ANY,
             id=FAKE_CUSTOMER["id"],
-            stripe_account=None,
+            stripe_account=self.customer.djstripe_owner_account.id,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
         self.customer.refresh_from_db()
@@ -695,12 +612,17 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         )
 
     @patch(
+        "stripe.Refund.create",
+        return_value=deepcopy(FAKE_REFUND),
+        autospec=True,
+    )
+    @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
-        return_value=deepcopy(FAKE_BALANCE_TRANSACTION),
+        return_value=deepcopy(FAKE_BALANCE_TRANSACTION_REFUND),
         autospec=True,
     )
     @patch("stripe.Charge.retrieve", autospec=True)
@@ -717,6 +639,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         charge_retrieve_mock,
         balance_transaction_retrieve_mock,
         default_account_mock,
+        refund_create_mock,
     ):
         default_account_mock.return_value = self.account
 
@@ -757,45 +680,23 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             },
         )
 
-        charge.refund()
-
-        refunded_charge, created2 = Charge._get_or_create_from_stripe_object(
-            fake_charge_no_invoice
-        )
-        self.assertFalse(created2)
-
-        self.assertEqual(refunded_charge.refunded, True)
-        self.assertEqual(refunded_charge.amount_refunded, decimal.Decimal("20.00"))
-
-        self.assert_fks(
-            refunded_charge,
-            expected_blank_fks={
-                "djstripe.Account.branding_logo",
-                "djstripe.Account.branding_icon",
-                "djstripe.Charge.application_fee",
-                "djstripe.Charge.dispute",
-                "djstripe.Charge.latest_invoice (related name)",
-                "djstripe.Charge.latest_upcominginvoice (related name)",
-                "djstripe.Charge.invoice",
-                "djstripe.Charge.on_behalf_of",
-                "djstripe.Charge.source_transfer",
-                "djstripe.Charge.transfer",
-                "djstripe.Customer.coupon",
-                "djstripe.Customer.default_payment_method",
-                "djstripe.PaymentIntent.invoice (related name)",
-                "djstripe.PaymentIntent.on_behalf_of",
-                "djstripe.PaymentIntent.payment_method",
-                "djstripe.PaymentIntent.upcominginvoice (related name)",
-            },
-        )
+        refund_object = charge.refund()
+        self.assertEqual(refund_object.status, "succeeded")
+        self.assertEqual(refund_object.charge.id, charge.id)
+        self.assertEqual(refund_object.amount, 2000)
 
     @patch(
+        "stripe.Refund.create",
+        return_value=deepcopy(FAKE_REFUND),
+        autospec=True,
+    )
+    @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
-        return_value=deepcopy(FAKE_BALANCE_TRANSACTION),
+        return_value=deepcopy(FAKE_BALANCE_TRANSACTION_REFUND),
         autospec=True,
     )
     @patch("stripe.Charge.retrieve", autospec=True)
@@ -812,6 +713,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         charge_retrieve_mock,
         balance_transaction_retrieve_mock,
         default_account_mock,
+        refund_create_mock,
     ):
         default_account_mock.return_value = self.account
 
@@ -852,31 +754,10 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             },
         )
 
-        refunded_charge = charge.refund()
-        self.assertEqual(refunded_charge.refunded, True)
-        self.assertEqual(refunded_charge.amount_refunded, decimal.Decimal("20.00"))
-
-        self.assert_fks(
-            refunded_charge,
-            expected_blank_fks={
-                "djstripe.Account.branding_logo",
-                "djstripe.Account.branding_icon",
-                "djstripe.Charge.application_fee",
-                "djstripe.Charge.dispute",
-                "djstripe.Charge.latest_invoice (related name)",
-                "djstripe.Charge.latest_upcominginvoice (related name)",
-                "djstripe.Charge.invoice",
-                "djstripe.Charge.on_behalf_of",
-                "djstripe.Charge.source_transfer",
-                "djstripe.Charge.transfer",
-                "djstripe.Customer.coupon",
-                "djstripe.Customer.default_payment_method",
-                "djstripe.PaymentIntent.invoice (related name)",
-                "djstripe.PaymentIntent.on_behalf_of",
-                "djstripe.PaymentIntent.payment_method",
-                "djstripe.PaymentIntent.upcominginvoice (related name)",
-            },
-        )
+        refund_object = charge.refund()
+        self.assertEqual(refund_object.status, "succeeded")
+        self.assertEqual(refund_object.charge.id, charge.id)
+        self.assertEqual(refund_object.amount, 2000)
 
     def test_calculate_refund_amount_partial_refund(self):
         charge = Charge(
@@ -896,7 +777,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
@@ -940,7 +821,12 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
+    )
+    @patch(
+        "stripe.Customer.retrieve",
+        return_value=deepcopy(FAKE_CUSTOMER),
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
@@ -959,9 +845,19 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         return_value=deepcopy(FAKE_CARD_AS_PAYMENT_METHOD),
         autospec=True,
     )
+    @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
     @patch("stripe.Invoice.retrieve", autospec=True)
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    @patch(
+        "stripe.SubscriptionItem.retrieve",
+        return_value=deepcopy(FAKE_SUBSCRIPTION_ITEM),
+        autospec=True,
     )
     @patch(
         "stripe.Subscription.retrieve",
@@ -971,13 +867,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     def test_charge_doesnt_require_invoice(
         self,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         product_retrieve_mock,
         invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         paymentmethod_card_retrieve_mock,
         payment_intent_retrieve_mock,
         charge_create_mock,
         charge_retrieve_mock,
         balance_transaction_retrieve_mock,
+        customer_retrieve_mock,
         default_account_mock,
     ):
         default_account_mock.return_value = self.account
@@ -999,7 +898,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
@@ -1039,16 +938,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self.customer.charge(
             amount=decimal.Decimal("10.00"),
             capture=True,
-            destination=FAKE_STANDARD_ACCOUNT["id"],
+            destination=FAKE_PLATFORM_ACCOUNT["id"],
         )
 
         _, kwargs = charge_create_mock.call_args
         self.assertEqual(kwargs["capture"], True)
-        self.assertEqual(kwargs["destination"], FAKE_STANDARD_ACCOUNT["id"])
+        self.assertEqual(kwargs["destination"], FAKE_PLATFORM_ACCOUNT["id"])
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
@@ -1089,7 +988,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
@@ -1130,11 +1029,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
         return_value=deepcopy(FAKE_BALANCE_TRANSACTION),
+        autospec=True,
+    )
+    @patch(
+        "stripe.SubscriptionItem.retrieve",
+        return_value=deepcopy(FAKE_SUBSCRIPTION_ITEM),
         autospec=True,
     )
     @patch(
@@ -1158,6 +1062,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     )
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
+    @patch(
+        "stripe.Invoice.retrieve",
+        autospec=True,
+        return_value=deepcopy(FAKE_INVOICE_III),
     )
     @patch(
         "stripe.Invoice.list",
@@ -1171,12 +1085,15 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self,
         invoice_retry_mock,
         invoice_list_mock,
+        invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         product_retrieve_mock,
         paymentmethod_card_retrieve_mock,
         payment_intent_retrieve_mock,
         charge_retrieve_mock,
         customer_retrieve_mock,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         balance_transaction_retrieve_mock,
         default_account_mock,
     ):
@@ -1189,11 +1106,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.BalanceTransaction.retrieve",
         return_value=deepcopy(FAKE_BALANCE_TRANSACTION),
+        autospec=True,
+    )
+    @patch(
+        "stripe.SubscriptionItem.retrieve",
+        return_value=deepcopy(FAKE_SUBSCRIPTION_ITEM),
         autospec=True,
     )
     @patch(
@@ -1219,6 +1141,14 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
     @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
+    @patch(
+        "stripe.Invoice.retrieve", autospec=True, return_value=deepcopy(FAKE_INVOICE)
+    )
+    @patch(
         "stripe.Invoice.list",
         return_value=StripeList(data=[deepcopy(FAKE_INVOICE)]),
         autospec=True,
@@ -1228,12 +1158,15 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self,
         invoice_retry_mock,
         invoice_list_mock,
+        invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         product_retrieve_mock,
         paymentmethod_card_retrieve_mock,
         payment_intent_retrieve_mock,
         charge_retrieve_mock,
         customer_retrieve_mock,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         balance_transaction_retrieve_mock,
         default_account_mock,
     ):
@@ -1245,11 +1178,15 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
+    )
+    @patch(
+        "stripe.SubscriptionItem.retrieve",
+        return_value=deepcopy(FAKE_SUBSCRIPTION_ITEM),
+        autospec=True,
     )
     @patch(
         "stripe.Subscription.retrieve",
-        return_value=deepcopy(FAKE_SUBSCRIPTION),
         autospec=True,
     )
     @patch(
@@ -1260,6 +1197,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
     @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
+    @patch(
+        "stripe.Invoice.retrieve",
+        autospec=True,
+        return_value=deepcopy(FAKE_INVOICE_III),
+    )
+    @patch(
         "stripe.Invoice.list",
         return_value=StripeList(data=[deepcopy(FAKE_INVOICE_III)]),
     )
@@ -1268,13 +1215,22 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self,
         invoice_retry_mock,
         invoice_list_mock,
+        invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         product_retrieve_mock,
         charge_retrieve_mock,
         customer_retrieve_mock,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         default_account_mock,
     ):
         default_account_mock.return_value = self.account
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest invoice should be the unpaid one
+        fake_subscription["latest_invoice"] = FAKE_INVOICE_III
+        subscription_retrieve_mock.return_value = fake_subscription
+
         invoice_retry_mock.side_effect = InvalidRequestError(
             "Invoice is already paid", "blah"
         )
@@ -1286,11 +1242,15 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Account.get_default_account",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
+    )
+    @patch(
+        "stripe.SubscriptionItem.retrieve",
+        return_value=deepcopy(FAKE_SUBSCRIPTION_ITEM),
+        autospec=True,
     )
     @patch(
         "stripe.Subscription.retrieve",
-        return_value=deepcopy(FAKE_SUBSCRIPTION),
         autospec=True,
     )
     @patch(
@@ -1301,6 +1261,16 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
     @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
+    @patch(
+        "stripe.Invoice.retrieve",
+        autospec=True,
+        return_value=deepcopy(FAKE_INVOICE_III),
+    )
+    @patch(
         "stripe.Invoice.list",
         return_value=StripeList(data=[deepcopy(FAKE_INVOICE_III)]),
     )
@@ -1309,13 +1279,22 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self,
         invoice_retry_mock,
         invoice_list_mock,
+        invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         product_retrieve_mock,
         charge_retrieve_mock,
         customer_retrieve_mock,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         default_account_mock,
     ):
         default_account_mock.return_value = self.account
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest invoice should be the unpaid one
+        fake_subscription["latest_invoice"] = FAKE_INVOICE_III
+        subscription_retrieve_mock.return_value = fake_subscription
+
         invoice_retry_mock.side_effect = InvalidRequestError(
             "This should fail!", "blah"
         )
@@ -1329,7 +1308,9 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self.assertTrue(return_status)
 
         invoice_create_mock.assert_called_once_with(
-            api_key=djstripe_settings.STRIPE_SECRET_KEY, customer=self.customer.id
+            api_key=djstripe_settings.STRIPE_SECRET_KEY,
+            customer=self.customer.id,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
     @patch("stripe.Invoice.create", autospec=True)
@@ -1342,7 +1323,9 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self.assertFalse(return_status)
 
         invoice_create_mock.assert_called_once_with(
-            api_key=djstripe_settings.STRIPE_SECRET_KEY, customer=self.customer.id
+            api_key=djstripe_settings.STRIPE_SECRET_KEY,
+            customer=self.customer.id,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
     @patch("stripe.Coupon.retrieve", return_value=deepcopy(FAKE_COUPON), autospec=True)
@@ -1379,7 +1362,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Invoice.sync_from_stripe_data",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.Invoice.list",
@@ -1398,7 +1381,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Invoice.sync_from_stripe_data",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch("stripe.Invoice.list", return_value=StripeList(data=[]), autospec=True)
     @patch(
@@ -1412,7 +1395,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Charge.sync_from_stripe_data",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.Charge.list",
@@ -1430,7 +1413,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Charge.sync_from_stripe_data",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch("stripe.Charge.list", return_value=StripeList(data=[]), autospec=True)
     @patch(
@@ -1444,7 +1427,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Subscription.sync_from_stripe_data",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.Subscription.list",
@@ -1463,7 +1446,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
     @patch(
         "djstripe.models.Subscription.sync_from_stripe_data",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch("stripe.Subscription.list", return_value=StripeList(data=[]), autospec=True)
     @patch(
@@ -1475,28 +1458,42 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         self.customer._sync_subscriptions()
         self.assertEqual(0, subscription_sync_mock.call_count)
 
-    @patch(
-        "stripe.Subscription.create",
-        return_value=deepcopy(FAKE_SUBSCRIPTION),
-        autospec=True,
-    )
+    @patch("stripe.Subscription.create", autospec=True)
     @patch(
         "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
     )
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
-    def test_subscribe_price_string(
+    def test_subscribe_price_string_new_style(
         self,
         product_retrieve_mock,
         customer_retrieve_mock,
         subscription_create_mock,
     ):
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
+        subscription_create_mock.return_value = fake_subscription
+
+        current_subscriptions = self.customer.subscriptions.count()
+
         price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
 
-        self.assert_fks(price, expected_blank_fks={})
+        self.assert_fks(
+            price,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
 
-        self.customer.subscribe(price=price.id)
+        self.customer.subscribe(items=[{"price": price.id}])
+
+        updated_subscriptions = self.customer.subscriptions.count()
+
+        # assert 1 new subscription got created
+        assert updated_subscriptions == current_subscriptions + 1
 
     @patch("stripe.Subscription.create", autospec=True)
     @patch(
@@ -1505,18 +1502,67 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
-    def test_subscription_shortcut_with_multiple_subscriptions(
+    def test_subscribe_price_string_old_style(
+        self,
+        product_retrieve_mock,
+        customer_retrieve_mock,
+        subscription_create_mock,
+    ):
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
+        subscription_create_mock.return_value = fake_subscription
+
+        current_subscriptions = self.customer.subscriptions.count()
+        price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
+
+        self.assert_fks(
+            price,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+
+        self.customer.subscribe(price=price.id)
+
+        updated_subscriptions = self.customer.subscriptions.count()
+
+        # assert 1 new subscription got created
+        assert updated_subscriptions == current_subscriptions + 1
+
+    @patch("stripe.Subscription.create", autospec=True)
+    @patch(
+        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
+    )
+    @patch(
+        "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    def test_subscription_shortcut_with_multiple_subscriptions_old_style(
         self, product_retrieve_mock, customer_retrieve_mock, subscription_create_mock
     ):
         price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
 
-        self.assert_fks(price, expected_blank_fks={})
+        self.assert_fks(
+            price,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
 
         subscription_fake_duplicate = deepcopy(FAKE_SUBSCRIPTION)
         subscription_fake_duplicate["id"] = "sub_6lsC8pt7IcF8jd"
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake_duplicate["latest_invoice"] = None
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
 
         subscription_create_mock.side_effect = [
-            deepcopy(FAKE_SUBSCRIPTION),
+            fake_subscription,
             subscription_fake_duplicate,
         ]
 
@@ -1529,6 +1575,119 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         with self.assertRaises(MultipleSubscriptionException):
             self.customer.subscription
 
+    @patch.object(Subscription, "_api_create", autospec=True)
+    @patch("stripe.Subscription.create", autospec=True)
+    @patch(
+        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
+    )
+    @patch(
+        "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    def test_subscription_shortcut_with_multiple_subscriptions_new_style_by_price(
+        self,
+        product_retrieve_mock,
+        customer_retrieve_mock,
+        subscription_create_mock,
+        subscription_api_create_mock,
+    ):
+        price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
+        self.assert_fks(
+            price,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+
+        subscription_fake_duplicate = deepcopy(FAKE_SUBSCRIPTION)
+        subscription_fake_duplicate["id"] = "sub_6lsC8pt7IcF8jd"
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake_duplicate["latest_invoice"] = None
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
+
+        subscription_create_mock.side_effect = [
+            fake_subscription,
+            subscription_fake_duplicate,
+        ]
+
+        subscription_api_create_mock.side_effect = [
+            fake_subscription,
+            subscription_fake_duplicate,
+        ]
+
+        self.customer.subscribe(items=[{"price": price}, {"price": price}])
+
+        self.assertEqual(1, self.customer.subscriptions.count())
+        self.assertEqual(1, len(self.customer.valid_subscriptions))
+
+        subscription_api_create_mock.assert_called_once_with(
+            items=[{"price": price.id}, {"price": price.id}], customer=self.customer.id
+        )
+
+    @patch.object(Subscription, "_api_create", autospec=True)
+    @patch("stripe.Subscription.create", autospec=True)
+    @patch(
+        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
+    )
+    @patch(
+        "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    def test_subscription_shortcut_with_multiple_subscriptions_new_style_by_price_and_plan(
+        self,
+        product_retrieve_mock,
+        customer_retrieve_mock,
+        subscription_create_mock,
+        subscription_api_create_mock,
+    ):
+        price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
+        plan = Plan.sync_from_stripe_data(deepcopy(FAKE_PLAN))
+        self.assert_fks(
+            price,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+        self.assert_fks(
+            plan,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+
+        subscription_fake_duplicate = deepcopy(FAKE_SUBSCRIPTION)
+        subscription_fake_duplicate["id"] = "sub_6lsC8pt7IcF8jd"
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake_duplicate["latest_invoice"] = None
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
+
+        subscription_create_mock.side_effect = [
+            fake_subscription,
+            subscription_fake_duplicate,
+        ]
+
+        subscription_api_create_mock.side_effect = [
+            fake_subscription,
+            subscription_fake_duplicate,
+        ]
+
+        self.customer.subscribe(items=[{"price": price}, {"plan": plan}])
+
+        self.assertEqual(1, self.customer.subscriptions.count())
+        self.assertEqual(1, len(self.customer.valid_subscriptions))
+
+        subscription_api_create_mock.assert_called_once_with(
+            items=[{"price": price.id}, {"plan": plan.id}], customer=self.customer.id
+        )
+
     @patch(
         "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
     )
@@ -1540,12 +1699,22 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     ):
         price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
 
-        self.assert_fks(price, expected_blank_fks={})
+        self.assert_fks(
+            price,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+
+        fake_subscription_upd = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription_upd["latest_invoice"] = None
 
         fake_subscriptions = [
-            deepcopy(FAKE_SUBSCRIPTION),
-            deepcopy(FAKE_SUBSCRIPTION),
-            deepcopy(FAKE_SUBSCRIPTION),
+            deepcopy(fake_subscription_upd),
+            deepcopy(fake_subscription_upd),
+            deepcopy(fake_subscription_upd),
         ]
 
         # update the status of all but one to be invalid,
@@ -1555,13 +1724,13 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         fake_subscriptions[2]["status"] = "incomplete_expired"
         fake_subscriptions[2]["id"] = fake_subscriptions[2]["id"] + "foo2"
 
-        for fake_subscription in fake_subscriptions:
+        for _fake_subscription in fake_subscriptions:
             with patch(
                 "stripe.Subscription.create",
                 autospec=True,
-                side_effect=[fake_subscription],
+                side_effect=[_fake_subscription],
             ):
-                self.customer.subscribe(price=price)
+                self.customer.subscribe(items=[{"price": price}])
 
         self.assertEqual(3, self.customer.subscriptions.count())
         self.assertEqual(1, len(self.customer.valid_subscriptions))
@@ -1574,7 +1743,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     @patch(
         "djstripe.models.InvoiceItem.sync_from_stripe_data",
         return_value="pancakes",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.InvoiceItem.create",
@@ -1601,12 +1770,13 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             invoice=77,
             metadata=None,
             subscription=25,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
     @patch(
         "djstripe.models.InvoiceItem.sync_from_stripe_data",
         return_value="pancakes",
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     @patch(
         "stripe.InvoiceItem.create",
@@ -1635,6 +1805,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
             invoice=77,
             metadata=None,
             subscription=25,
+            stripe_version=djstripe_settings.STRIPE_API_VERSION,
         )
 
     def test_add_invoice_item_bad_decimal(self):
@@ -1643,6 +1814,22 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         ):
             self.customer.add_invoice_item(amount=5000, currency="usd")
 
+    @patch(
+        "stripe.BalanceTransaction.retrieve",
+        return_value=deepcopy(FAKE_BALANCE_TRANSACTION),
+        autospec=True,
+    )
+    @patch("stripe.Charge.retrieve", return_value=deepcopy(FAKE_CHARGE), autospec=True)
+    @patch(
+        "stripe.PaymentMethod.retrieve",
+        return_value=deepcopy(FAKE_CARD_AS_PAYMENT_METHOD),
+        autospec=True,
+    )
+    @patch(
+        "stripe.PaymentIntent.retrieve",
+        return_value=deepcopy(FAKE_PAYMENT_INTENT_I),
+        autospec=True,
+    )
     @patch(
         "stripe.Plan.retrieve",
         return_value=deepcopy(FAKE_PLAN),
@@ -1654,49 +1841,91 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         autospec=True,
     )
     @patch(
+        "stripe.SubscriptionItem.retrieve",
+        autospec=True,
+    )
+    @patch(
         "stripe.Subscription.retrieve",
         return_value=deepcopy(FAKE_SUBSCRIPTION),
         autospec=True,
     )
     @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
+    @patch(
+        "stripe.Invoice.retrieve", autospec=True, return_value=deepcopy(FAKE_INVOICE)
+    )
+    @patch(
         "stripe.Invoice.upcoming",
-        return_value=deepcopy(FAKE_UPCOMING_INVOICE),
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     def test_upcoming_invoice_plan(
         self,
         invoice_upcoming_mock,
+        invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         product_retrieve_mock,
         plan_retrieve_mock,
+        payment_intent_retrieve_mock,
+        paymentmethod_card_retrieve_mock,
+        charge_retrieve_mock,
+        balance_transaction_retrieve_mock,
     ):
+        fake_upcoming_invoice_data = deepcopy(FAKE_UPCOMING_INVOICE)
+        fake_upcoming_invoice_data["lines"]["data"][0]["subscription"] = (
+            FAKE_SUBSCRIPTION["id"]
+        )
+        invoice_upcoming_mock.return_value = fake_upcoming_invoice_data
+
+        fake_subscription_item_data = deepcopy(FAKE_SUBSCRIPTION_ITEM)
+        fake_subscription_item_data["plan"] = deepcopy(FAKE_PLAN)
+        fake_subscription_item_data["subscription"] = deepcopy(FAKE_SUBSCRIPTION)["id"]
+        subscription_item_retrieve_mock.return_value = fake_subscription_item_data
+
         invoice = self.customer.upcoming_invoice()
         self.assertIsNotNone(invoice)
         self.assertIsNone(invoice.id)
         self.assertIsNone(invoice.save())
 
-        subscription_retrieve_mock.assert_called_once_with(
-            api_key=ANY, expand=ANY, id=FAKE_SUBSCRIPTION["id"], stripe_account=None
+        # one more because of creating the associated line item
+        subscription_retrieve_mock.assert_has_calls(
+            [
+                call(
+                    api_key=djstripe_settings.STRIPE_SECRET_KEY,
+                    expand=[],
+                    id=FAKE_SUBSCRIPTION["id"],
+                    stripe_account=None,
+                    stripe_version="2020-08-27",
+                ),
+                call(
+                    api_key=djstripe_settings.STRIPE_SECRET_KEY,
+                    expand=[],
+                    id=FAKE_SUBSCRIPTION["id"],
+                    stripe_account=None,
+                    stripe_version="2020-08-27",
+                ),
+            ]
         )
+
         plan_retrieve_mock.assert_not_called()
 
-        items = invoice.invoiceitems.all()
+        items = invoice.lineitems.all()
+
         self.assertEqual(1, len(items))
-        self.assertEqual(FAKE_SUBSCRIPTION["id"], items[0].id)
+        self.assertEqual("il_fakefakefakefakefake0002", items[0].id)
+        self.assertEqual(0, invoice.invoiceitems.count())
 
         self.assertIsNotNone(invoice.plan)
         self.assertEqual(FAKE_PLAN["id"], invoice.plan.id)
 
-        invoice._invoiceitems = []
-        items = invoice.invoiceitems.all()
+        invoice._lineitems = []
+        items = invoice.lineitems.all()
         self.assertEqual(0, len(items))
         self.assertIsNotNone(invoice.plan)
-
-    @patch("stripe.Customer.retrieve", autospec=True)
-    def test_delete_subscriber_without_customer_is_noop(self, customer_retrieve_mock):
-        self.user.delete()
-        for customer in self.user.djstripe_customers.all():
-            self.assertIsNone(customer.date_purged)
 
     @patch("stripe.Subscription.create", autospec=True)
     @patch(
@@ -1705,8 +1934,11 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
-    def test_is_subscribed_to_with_product(
-        self, product_retrieve_mock, customer_retrieve_mock, subscription_create_mock
+    def test_is_subscribed_to_with_product_old_style(
+        self,
+        product_retrieve_mock,
+        customer_retrieve_mock,
+        subscription_create_mock,
     ):
         price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
         product = Product.sync_from_stripe_data(deepcopy(FAKE_PRODUCT))
@@ -1715,10 +1947,13 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         subscription_fake["current_period_end"] = datetime_to_unix(
             timezone.now() + timezone.timedelta(days=7)
         )
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake["latest_invoice"] = None
 
         subscription_create_mock.return_value = subscription_fake
 
-        self.customer.subscribe(price=price)
+        self.customer.subscribe(items=[{"price": price}])
 
         assert self.customer.is_subscribed_to(product)
 
@@ -1729,7 +1964,7 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
-    def test_is_subscribed_to_with_product_string(
+    def test_is_subscribed_to_with_product_new_style(
         self, product_retrieve_mock, customer_retrieve_mock, subscription_create_mock
     ):
         price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
@@ -1739,6 +1974,63 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
         subscription_fake["current_period_end"] = datetime_to_unix(
             timezone.now() + timezone.timedelta(days=7)
         )
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake["latest_invoice"] = None
+
+        subscription_create_mock.return_value = subscription_fake
+
+        self.customer.subscribe(items=[{"price": price}])
+
+        assert self.customer.is_subscribed_to(product)
+
+    @patch("stripe.Subscription.create", autospec=True)
+    @patch(
+        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
+    )
+    @patch(
+        "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    def test_is_subscribed_to_with_product_string_new_style(
+        self, product_retrieve_mock, customer_retrieve_mock, subscription_create_mock
+    ):
+        price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
+        product = Product.sync_from_stripe_data(deepcopy(FAKE_PRODUCT))
+
+        subscription_fake = deepcopy(FAKE_SUBSCRIPTION)
+        subscription_fake["current_period_end"] = datetime_to_unix(
+            timezone.now() + timezone.timedelta(days=7)
+        )
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake["latest_invoice"] = None
+
+        subscription_create_mock.return_value = subscription_fake
+
+        self.customer.subscribe(items=[{"price": price}])
+
+        assert self.customer.is_subscribed_to(product.id)
+
+    @patch("stripe.Subscription.create", autospec=True)
+    @patch(
+        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
+    )
+    @patch(
+        "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    def test_is_subscribed_to_with_product_string_by_price(
+        self, product_retrieve_mock, customer_retrieve_mock, subscription_create_mock
+    ):
+        price = Price.sync_from_stripe_data(deepcopy(FAKE_PRICE))
+        product = Product.sync_from_stripe_data(deepcopy(FAKE_PRODUCT))
+
+        subscription_fake = deepcopy(FAKE_SUBSCRIPTION)
+        subscription_fake["current_period_end"] = datetime_to_unix(
+            timezone.now() + timezone.timedelta(days=7)
+        )
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake["latest_invoice"] = None
 
         subscription_create_mock.return_value = subscription_fake
 
@@ -1748,8 +2040,11 @@ class TestCustomer(AssertStripeFksMixin, TestCase):
 
 
 # These tests use Plan which is deprecated in favor of Price
-class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
+class TestCustomerLegacy(CreateAccountMixin, AssertStripeFksMixin, TestCase):
     def setUp(self):
+        # create a Stripe Platform Account
+        self.account = FAKE_PLATFORM_ACCOUNT.create()
+
         self.user = get_user_model().objects.create_user(
             username="pydanny", email="pydanny@gmail.com"
         )
@@ -1763,11 +2058,8 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
         self.customer.default_source = self.payment_method
         self.customer.save()
 
-        self.account = FAKE_STANDARD_ACCOUNT.create()
-
     @patch(
         "stripe.Subscription.create",
-        return_value=deepcopy(FAKE_SUBSCRIPTION),
         autospec=True,
     )
     @patch(
@@ -1776,7 +2068,7 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
-    def test_subscribe_plan_string(
+    def test_subscribe_plan_string_new_style(
         self,
         product_retrieve_mock,
         customer_retrieve_mock,
@@ -1784,10 +2076,67 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
     ):
         plan = Plan.sync_from_stripe_data(deepcopy(FAKE_PLAN))
 
-        self.assert_fks(plan, expected_blank_fks={})
+        self.assert_fks(
+            plan,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
 
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
+        subscription_create_mock.return_value = fake_subscription
+
+        current_subscriptions = self.customer.subscriptions.count()
+        self.customer.subscribe(items=[{"plan": plan.id}])
+
+        updated_subscriptions = self.customer.subscriptions.count()
+
+        # assert 1 new subscription got created
+        assert updated_subscriptions == current_subscriptions + 1
+
+    @patch(
+        "stripe.Subscription.create",
+        autospec=True,
+    )
+    @patch(
+        "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
+    )
+    @patch(
+        "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
+    )
+    def test_subscribe_plan_string_old_style(
+        self,
+        product_retrieve_mock,
+        customer_retrieve_mock,
+        subscription_create_mock,
+    ):
+        plan = Plan.sync_from_stripe_data(deepcopy(FAKE_PLAN))
+
+        self.assert_fks(
+            plan,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
+        subscription_create_mock.return_value = fake_subscription
+
+        current_subscriptions = self.customer.subscriptions.count()
         self.customer.subscribe(plan=plan.id)
 
+        updated_subscriptions = self.customer.subscriptions.count()
+
+        # assert 1 new subscription got created
+        assert updated_subscriptions == current_subscriptions + 1
+
+    @patch.object(Subscription, "_api_create", autospec=True)
     @patch("stripe.Subscription.create", autospec=True)
     @patch(
         "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
@@ -1795,29 +2144,50 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
     @patch(
         "stripe.Product.retrieve", return_value=deepcopy(FAKE_PRODUCT), autospec=True
     )
-    def test_subscription_shortcut_with_multiple_subscriptions(
-        self, product_retrieve_mock, customer_retrieve_mock, subscription_create_mock
+    def test_subscription_shortcut_with_multiple_subscriptions_new_style_by_plan(
+        self,
+        product_retrieve_mock,
+        customer_retrieve_mock,
+        subscription_create_mock,
+        subscription_api_create_mock,
     ):
         plan = Plan.sync_from_stripe_data(deepcopy(FAKE_PLAN))
-
-        self.assert_fks(plan, expected_blank_fks={})
+        self.assert_fks(
+            plan,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
 
         subscription_fake_duplicate = deepcopy(FAKE_SUBSCRIPTION)
         subscription_fake_duplicate["id"] = "sub_6lsC8pt7IcF8jd"
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        subscription_fake_duplicate["latest_invoice"] = None
+
+        fake_subscription = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription["latest_invoice"] = None
 
         subscription_create_mock.side_effect = [
-            deepcopy(FAKE_SUBSCRIPTION),
+            fake_subscription,
             subscription_fake_duplicate,
         ]
 
-        self.customer.subscribe(plan=plan)
-        self.customer.subscribe(plan=plan)
+        subscription_api_create_mock.side_effect = [
+            fake_subscription,
+            subscription_fake_duplicate,
+        ]
 
-        self.assertEqual(2, self.customer.subscriptions.count())
-        self.assertEqual(2, len(self.customer.valid_subscriptions))
+        self.customer.subscribe(items=[{"plan": plan}, {"plan": plan}])
 
-        with self.assertRaises(MultipleSubscriptionException):
-            self.customer.subscription
+        self.assertEqual(1, self.customer.subscriptions.count())
+        self.assertEqual(1, len(self.customer.valid_subscriptions))
+
+        subscription_api_create_mock.assert_called_once_with(
+            items=[{"plan": plan.id}, {"plan": plan.id}], customer=self.customer.id
+        )
 
     @patch(
         "stripe.Customer.retrieve", return_value=deepcopy(FAKE_CUSTOMER), autospec=True
@@ -1830,12 +2200,22 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
     ):
         plan = Plan.sync_from_stripe_data(deepcopy(FAKE_PLAN))
 
-        self.assert_fks(plan, expected_blank_fks={})
+        self.assert_fks(
+            plan,
+            expected_blank_fks={
+                "djstripe.Product.default_price",
+            },
+        )
+
+        fake_subscription_upd = deepcopy(FAKE_SUBSCRIPTION)
+        # latest_invoice has to be None for an invoice that doesn't exist yet
+        # and hence cannot have been billed yet
+        fake_subscription_upd["latest_invoice"] = None
 
         fake_subscriptions = [
-            deepcopy(FAKE_SUBSCRIPTION),
-            deepcopy(FAKE_SUBSCRIPTION),
-            deepcopy(FAKE_SUBSCRIPTION),
+            deepcopy(fake_subscription_upd),
+            deepcopy(fake_subscription_upd),
+            deepcopy(fake_subscription_upd),
         ]
 
         # update the status of all but one to be invalid,
@@ -1845,13 +2225,13 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
         fake_subscriptions[2]["status"] = "incomplete_expired"
         fake_subscriptions[2]["id"] = fake_subscriptions[2]["id"] + "foo2"
 
-        for fake_subscription in fake_subscriptions:
+        for _fake_subscription in fake_subscriptions:
             with patch(
                 "stripe.Subscription.create",
                 autospec=True,
-                side_effect=[fake_subscription],
+                side_effect=[_fake_subscription],
             ):
-                self.customer.subscribe(plan=plan)
+                self.customer.subscribe(items=[{"plan": plan}])
 
         self.assertEqual(3, self.customer.subscriptions.count())
         self.assertEqual(1, len(self.customer.valid_subscriptions))
@@ -1861,6 +2241,22 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
 
         self.assertEqual(fake_subscriptions[0]["id"], self.customer.subscription.id)
 
+    @patch(
+        "stripe.BalanceTransaction.retrieve",
+        return_value=deepcopy(FAKE_BALANCE_TRANSACTION),
+        autospec=True,
+    )
+    @patch("stripe.Charge.retrieve", return_value=deepcopy(FAKE_CHARGE), autospec=True)
+    @patch(
+        "stripe.PaymentMethod.retrieve",
+        return_value=deepcopy(FAKE_CARD_AS_PAYMENT_METHOD),
+        autospec=True,
+    )
+    @patch(
+        "stripe.PaymentIntent.retrieve",
+        return_value=deepcopy(FAKE_PAYMENT_INTENT_I),
+        autospec=True,
+    )
     @patch(
         "stripe.Plan.retrieve",
         return_value=deepcopy(FAKE_PLAN),
@@ -1872,40 +2268,88 @@ class TestCustomerLegacy(AssertStripeFksMixin, TestCase):
         autospec=True,
     )
     @patch(
+        "stripe.SubscriptionItem.retrieve",
+        autospec=True,
+    )
+    @patch(
         "stripe.Subscription.retrieve",
         return_value=deepcopy(FAKE_SUBSCRIPTION),
         autospec=True,
     )
     @patch(
+        "stripe.InvoiceItem.retrieve",
+        return_value=deepcopy(FAKE_INVOICEITEM),
+        autospec=True,
+    )
+    @patch(
+        "stripe.Invoice.retrieve", autospec=True, return_value=deepcopy(FAKE_INVOICE)
+    )
+    @patch(
         "stripe.Invoice.upcoming",
-        return_value=deepcopy(FAKE_UPCOMING_INVOICE),
-        autospec=IS_STATICMETHOD_AUTOSPEC_SUPPORTED,
+        autospec=True,
     )
     def test_upcoming_invoice(
         self,
         invoice_upcoming_mock,
+        invoice_retrieve_mock,
+        invoice_item_retrieve_mock,
         subscription_retrieve_mock,
+        subscription_item_retrieve_mock,
         product_retrieve_mock,
         plan_retrieve_mock,
+        payment_intent_retrieve_mock,
+        paymentmethod_card_retrieve_mock,
+        charge_retrieve_mock,
+        balance_transaction_retrieve_mock,
     ):
+        fake_upcoming_invoice_data = deepcopy(FAKE_UPCOMING_INVOICE)
+        fake_upcoming_invoice_data["lines"]["data"][0]["subscription"] = (
+            FAKE_SUBSCRIPTION["id"]
+        )
+        invoice_upcoming_mock.return_value = fake_upcoming_invoice_data
+
+        fake_subscription_item_data = deepcopy(FAKE_SUBSCRIPTION_ITEM)
+        fake_subscription_item_data["plan"] = deepcopy(FAKE_PLAN)
+        fake_subscription_item_data["subscription"] = deepcopy(FAKE_SUBSCRIPTION)["id"]
+        subscription_item_retrieve_mock.return_value = fake_subscription_item_data
+
         invoice = self.customer.upcoming_invoice()
         self.assertIsNotNone(invoice)
         self.assertIsNone(invoice.id)
         self.assertIsNone(invoice.save())
 
-        subscription_retrieve_mock.assert_called_once_with(
-            api_key=ANY, expand=ANY, id=FAKE_SUBSCRIPTION["id"], stripe_account=None
+        # one more because of creating the associated line item
+        subscription_retrieve_mock.assert_has_calls(
+            [
+                call(
+                    api_key=djstripe_settings.STRIPE_SECRET_KEY,
+                    expand=[],
+                    id=FAKE_SUBSCRIPTION["id"],
+                    stripe_account=None,
+                    stripe_version="2020-08-27",
+                ),
+                call(
+                    api_key=djstripe_settings.STRIPE_SECRET_KEY,
+                    expand=[],
+                    id=FAKE_SUBSCRIPTION["id"],
+                    stripe_account=None,
+                    stripe_version="2020-08-27",
+                ),
+            ]
         )
+
         plan_retrieve_mock.assert_not_called()
 
-        items = invoice.invoiceitems.all()
+        items = invoice.lineitems.all()
+
         self.assertEqual(1, len(items))
-        self.assertEqual(FAKE_SUBSCRIPTION["id"], items[0].id)
+        self.assertEqual("il_fakefakefakefakefake0002", items[0].id)
+        self.assertEqual(0, invoice.invoiceitems.count())
 
         self.assertIsNotNone(invoice.plan)
         self.assertEqual(FAKE_PLAN["id"], invoice.plan.id)
 
-        invoice._invoiceitems = []
-        items = invoice.invoiceitems.all()
+        invoice._lineitems = []
+        items = invoice.lineitems.all()
         self.assertEqual(0, len(items))
         self.assertIsNotNone(invoice.plan)

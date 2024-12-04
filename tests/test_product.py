@@ -11,17 +11,29 @@ from djstripe.models import Product
 from djstripe.models.core import Price
 
 from . import (
+    FAKE_FILEUPLOAD_ICON,
+    FAKE_PLATFORM_ACCOUNT,
     FAKE_PRICE,
     FAKE_PRICE_METERED,
     FAKE_PRICE_ONETIME,
     FAKE_PRICE_TIER,
     FAKE_PRODUCT,
 )
+from .conftest import CreateAccountMixin
 
 pytestmark = pytest.mark.django_db
 
 
-class TestProduct:
+class TestProduct(CreateAccountMixin):
+    #
+    # Helper Methods for monkeypatching
+    #
+    def mock_file_retrieve(*args, **kwargs):
+        return deepcopy(FAKE_FILEUPLOAD_ICON)
+
+    def mock_account_retrieve(*args, **kwargs):
+        return deepcopy(FAKE_PLATFORM_ACCOUNT)
+
     def mock_product_get(self, *args, **kwargs):
         return deepcopy(FAKE_PRODUCT)
 
@@ -55,11 +67,9 @@ class TestProduct:
             )
 
     def test_sync_from_stripe_data(self, monkeypatch):
-
         # monkeypatch stripe.Product.retrieve call to return
         # the desired json response.
         monkeypatch.setattr(stripe.Product, "retrieve", self.mock_product_get)
-
         product = Product.sync_from_stripe_data(deepcopy(FAKE_PRODUCT))
 
         assert product.id == FAKE_PRODUCT["id"]

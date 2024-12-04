@@ -21,7 +21,7 @@ class Command(VerbosityAwareOutputMixin, BaseCommand):
     )
 
     def add_arguments(self, parser):
-        """Add optional arugments to filter Events by."""
+        """Add optional arguments to filter Events by."""
         # Use a mutually exclusive group to prevent multiple arguments being
         # specified together.
         group = parser.add_mutually_exclusive_group()
@@ -59,11 +59,9 @@ class Command(VerbosityAwareOutputMixin, BaseCommand):
         if failed:
             self.output("Processing all failed events")
         elif type_filter:
-            self.output(
-                "Processing all events that match {filter}".format(filter=type_filter)
-            )
+            self.output(f"Processing all events that match {type_filter}")
         elif event_ids:
-            self.output("Processing specific events {events}".format(events=event_ids))
+            self.output(f"Processing specific events {event_ids}")
         else:
             self.output("Processing all available events")
 
@@ -72,7 +70,9 @@ class Command(VerbosityAwareOutputMixin, BaseCommand):
         if event_ids:
             listed_events = (
                 models.Event.stripe_class.retrieve(
-                    id=event_id, api_key=djstripe_settings.STRIPE_SECRET_KEY
+                    id=event_id,
+                    api_key=djstripe_settings.STRIPE_SECRET_KEY,
+                    stripe_version=djstripe_settings.STRIPE_API_VERSION,
                 )
                 for event_id in event_ids
             )
